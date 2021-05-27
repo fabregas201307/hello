@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 
-class SectorData:
+class Calculator:
     """Data processing machinery.
     standard data schema: as_of_date, sid, data_value, kpi_value, period_from, period_to
     """
