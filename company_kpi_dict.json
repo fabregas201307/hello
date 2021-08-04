@@ -1,0 +1,209 @@
+{
+    "AAPL": {
+        "EPS": [],
+        "IPHONE_SALES": [],
+        "REVENUE": [],
+    },
+    "AMZN": {
+        "AWS_NET_SALES": [],
+        "AWS_OPERATING_INCOME": [],
+        "EPS": [],
+        "INTERNATIONAL_NET_SALES": [],
+        "INTERNATIONAL_OPERATING_INCOME": [],
+        "NORTH_AMERICA_NET_SALES": [],
+        "NORTH_AMERICA_OPERATING_INCOME": [],
+        "REVENUE": []
+    },
+    "ATVI": {
+        "EPS_GAAP": [],
+        "EPS_NON_GAAP": [],
+        "EPS_NON_GAAP_IMPACT": [],
+        "REV_ACTIVISION": [],
+        "REV_BLIZZARD": [],
+        "REV_GAAP": [],
+        "REV_GAAP_IMPACT": [],
+        "REV_KING": [],
+    },
+    "BABA": {
+        "ADJ_EBITA": [],
+        "ADJ_EBITA_CLOUD": [],
+        "ADJ_EBITA_DIGITAL": [],
+        "ADJ_EBITDA": [],
+        "EPS": [],
+        "REVENUE": [],
+        "REV_CLOUD": [],
+        "REV_DIGITAL": []
+    },
+    "BEN": {
+
+    },
+    "BIDU": {
+
+    },
+    "CME": {
+
+    },
+    "CRI": {
+        "SGA": [],
+        "GROSS_PROFIT": [],
+        "TAX": [],
+        "NET_INCOME": [],
+        "EPS": [],
+        "REVENUE": [],
+        "SHARES_BASIC": [],
+        "SHARES_DILUTED": [],
+        "INTEREST": [],
+        "EBITDA": [],
+        "ADJ_EBITDA": [],
+        "REV_RETAIL": [],
+        "REV_WHOLESALE": [],
+        "REV_INT": [],
+    },
+    "DIS": {
+        "REVENUE": [],
+        "REV_MEDIA": [],
+        "REV_PARKS": [],
+        "REV_STUDIO": [],
+        "REV_CONSUMER": [],
+        "REV_CABLE": [],
+        "REV_BROADCAST": [],
+        "INC_MEDIA": [],
+        "INC_PARKS": [],
+        "INC_STUDIO": [],
+        "INC_CONSUMER": [],
+        "INC_CABLE": [],
+        "INC_BROADCAST": [],
+        "INC_TOTAL": [],
+        "DISNEY_SUB": [],
+    },
+    "EA": {
+
+    },
+    "EA": {
+
+    },
+    "EBAY": {
+
+    },
+    "ETSY": {
+
+    },
+    "FB": {
+        "ADV_REVENUE": [],
+        "DAP": [],
+        "DAU": [],
+        "EPS": [],
+        "FXN_ADV_GROWTH": [],
+        "MAP": [],
+        "MAU": [],
+        "REVENUE": []
+    },
+    "FOXA": {
+
+    },
+    "HAS": {
+
+    },
+    "HBI": {
+
+    },
+    "IVZ": {
+
+    },
+    "LYFT": {
+
+    },
+    "MELI": {
+
+    },
+    "MTB": {
+
+    },
+    "ORLY": {
+
+    },
+    "PINS": {
+
+    },
+    "SNAP": {
+
+    },
+    "SPGI": {
+
+    },
+    "TSCO": {
+
+    },
+    "TTWO": {
+
+    },
+    "TWTR": {
+
+    },
+    "UAA": {
+
+    },
+    "UBER": {
+
+    },
+    "VFC": {
+
+    },
+    "W": {
+
+    },
+    "Z": {
+
+    },
+    "DIN": {
+        "SYSTEM_WIDE_SALES": ["earnest", "consumer_edge", "1010data"],
+        "SYSTEM_WIDE_SALES_APPLEBEES": ["earnest", "consumer_edge", "1010data"],
+        "SYSTEM_WIDE_SALES_IHOP": ["earnest", "consumer_edge"],
+    },
+    "DLTR": {
+        "NET_SALES": ["earnest", "consumer_edge", "1010data"],
+        "DOLLAR_TREE_SALES": ["earnest", "consumer_edge", "1010data"],
+        "FAMILY_DOLLAR_SALES": ["earnest", "consumer_edge", "1010data"],
+    },
+    "FIVE": {
+        "TOTAL_REVENUE": ["earnest", "consumer_edge", "1010data"],
+    },
+    "HD": {
+        "NET_SALES": ["earnest", "consumer_edge", "1010data"],
+    },
+    "KSS": {
+        "TOTAL_REVENUE": ["earnest", "consumer_edge", "1010data"],
+    },
+    "CHWY": {
+        "NET_SALES": ["earnest", "consumer_edge", "1010data"],
+    },
+    "CAKE": {
+        "TOTAL_REVENUE": ["earnest", "consumer_edge", "1010data"],
+    },
+    "CMG": {
+        "REVENUE": ["earnest", "consumer_edge", "1010data"],
+    },
+    "DRI": {
+        "SALES": ["earnest", "consumer_edge", "1010data"],
+        "LONGHORN_STEAKHOUSE_SALES": ["earnest", "consumer_edge", "1010data"],
+        "OLIVE_GARDEN_SALES": ["earnest", "consumer_edge", "1010data"],
+    },
+    "COST": {
+        "TOTAL_REVENUE": ["earnest", "consumer_edge", "1010data"],
+    },
+    "AKZA NA": {
+        "SALES": ["yipit"],
+    },
+    "BEDU US": {
+        "SALES": ["sandalwood"],
+    },
+    "JNJ US": {
+        "SALES": ["yipit", "sandalwood"],
+    },
+    "KO US": {
+        "SALES": ["yipit", "sandalwood"],
+    },
+    "MUL LN": {
+        "SALES": ["sandalwood"],
+    },
+}
