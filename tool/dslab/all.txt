@@ -1,0 +1,3580 @@
+'mlmodel.py'
+
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+This class provides modeling building tools.
+"""
+
+import os
+import re
+import sys
+import html
+import copy
+import inspect
+import logging
+import numpy as np
+import pandas as pd
+from scipy import stats
+from functools import reduce
+from collections import OrderedDict
+
+import sklearn
+from sklearn import tree
+from sklearn import metrics as metrics_
+from sklearn.decomposition import FastICA, PCA
+from sklearn.linear_model.base import LinearModel
+from sklearn.model_selection import cross_val_score
+
+from mltemplate.graphviz import MLSource
+from mltemplate.mlutils import merge_dict
+from mltemplate.ml_metrics import metric_codes
+from mltemplate.config import init_logger, log_fun_info
+from mltemplate.ml_models import model_codes, model_helpers
+
+GRAPHVIZ_UNIX_DIR = '/usr/local/graphviz-2.28.0/bin/'
+sys.path.append("/usr/local/graphviz/bin")
+logger = init_logger(__name__, logging.WARN)
+
+# METRIC_MAP = {'r2': 'r2_score',
+#               'meae': 'median_absolute_error',
+#               'mse': 'mean_squared_error',
+#               'mae': 'mean_absolute_error',
+#               'evs': 'explained_variance_score',
+#               'f1': 'f1_score',
+#               'log_loss': 'log_loss',
+#               'precision': 'precision_score',
+#               'recall': 'recall_score',
+#               'accuracy': 'accuracy_score',
+#               'prfs': 'precision_recall_fscore_support',
+#               'confusion': 'confusion_matrix'}
+
+CROSS_VALIDATION_METRIC_MAP = {'r2': 'r2',
+                               'meae': 'median_absolute_error',
+                               'mse': 'mean_squared_error',
+                               'mae': 'mean_absolute_error',
+                               'f1': 'f1',
+                               'log_loss': 'log_loss',
+                               'precision': 'precision',
+                               'recall': 'recall',
+                               'accuracy': 'accuracy'}
+
+
+class MLModel:
+    """
+    Define the model, train the model and test the model
+    **Class Attributes**:
+    :py:attr:`self.model`: the machine learning model.
+    :py:attr:`self.models`: a dict containing a list of models with their names.
+    """
+    def __init__(self, model=None, models=None):
+        """
+        Constructor.
+        :param model:   sklearn model
+        :param models:  list of sklearn models
+        """
+        # TODO: model vs. models; let's revisit when we have a clearly defined use case
+        #       for multiple models.
+        #       In the meantime, please keep MLModel instances as 1:1 with an sklearn model obj
+        log_fun_info(logger)
+        self.model = model
+        self.models = models
+        self.model_type = None
+        self.indep_cols = None
+
+    def set_frp_dp(self, frp, dp):
+        """
+        Set fix rule predictor
+        :param frp:     Class, the fix rule predictor.
+        :param dp:      Class, the data processor.
+        """
+        # TODO: Is this now deprecated?
+        self.frp = frp
+        self.dp = dp
+
+    def _check_model_type(self):
+        """
+        model type validation
+        :return:
+        :raise:     ValueError
+        """
+        if self.model_type is None:
+            raise ValueError("Please define a regressor or classifier!")
+        elif self.model_type not in model_codes.MODEL_TYPES:
+            msg = "Model type '{}' is invalid; does not match any available model types {}!"
+            raise ValueError(msg.format(self.model_type, ", ".join(model_codes.MODEL_TYPES)))
+
+    def define_regressor(self, model_name=model_codes.DECISION_TREE_REGRESSOR, **kwargs):
+        """
+        Initiate a given regressor model type
+        :param model_name:  str the name of the regressor
+                    all:    All Regressors
+                    ols:    Ordinary Least Square
+                    ridge:  Ridge Regressor
+                    lasso:  Lasso Regressor
+                    enet:   Elastic Net Regressor
+                    bayes:  Bayesian Ridge Regressor
+                    ransac: RANSAC (robust regression)
+                    rfrgr:     Random Forest Regressor
+                    ert:    Extremely Randomized Trees
+                    ab:     Ada Boost Regressor
+                    gbrgr:     Gradient Boosting Regressor
+                    bag:    Bagging
+                    svr:    Support Vector Machine Regressor
+                    dtrgr:     Decision Tree Regressor
+                    knnrgr:    KNeighbors Regressor
+        :param kwargs:      dict single regressor parameters; elif 'all' option, params should be split by model
+        :raise ValueError:  invalid model_name passed
+        """
+        log_fun_info(logger, log_arg=True)
+
+        # TODO: Refactor
+        #     You chose 'all' but now can optionally select partial params through kwargs
+        #     What protection is there from mixing single and multi-models?
+        #     Multi-model method should be different aggregator of single-model methods
+        if model_name == model_codes.RUN_ALL_REGRESSORS:
+            self.model = None
+            self.models = {
+                name: constructor()
+                for name, constructor in model_codes.REGRESSION_MODELS.items()
+            }
+            for model_name in kwargs:
+                self.models[model_name].set_params(**kwargs[model_name])
+        elif model_name in model_codes.REGRESSION_MODELS:
+            self.models = None
+            self.model = model_codes.REGRESSION_MODELS[model_name]()
+            self.model.set_params(**kwargs)
+        else:
+            msg = "{} is an invalid regressor"
+            raise ValueError(msg.format(model_name))
+
+        self.model_type = model_codes.REGRESSION_MODEL_TYPE
+
+    def define_classifier(self, model_name=model_codes.RANDOM_FOREST_CLASSIFIER, **kwargs):
+        """
+        Initiate the classifier
+        :param model_name:  str, the name of the classifier.
+                     all:   all classifiers
+                     rf:    Random Forest Classifier
+                     ert:   Extremely Randomized Trees
+                     ab:    Ada Boost Classifier
+                     gb:    Gradient Boosting Classifier
+                     bag:   Bagging
+                     lsvc:  Linear SVC
+                     svm:   Support Vector Machine
+                     dt:    Decision Tree Classifier
+                     lg:    Logistic Regression
+                     lda:   Linear Discriminant Analysis
+                     qda:   Quadratic Discriminant Analysis
+                     gnb:   Gaussian Naive Bayes
+                     bnb:   Bernoulli Naive Bayes
+                     mnb:   Multinomial Naive Bayes
+                     knn:   KNeighbors Classifier
+        :param kwargs:      use dictionary or key word arguments for classifier parameters
+        :raise:             ValueError
+        """
+        log_fun_info(logger, log_arg=True)
+
+        if model_name == model_codes.RUN_ALL_CLASSIFIERS:
+            self.model = None
+            self.models = {
+                name: constructor()
+                for name, constructor in model_codes.CLASSIFICATION_MODELS.items()
+            }
+            for model_name in kwargs:
+                self.models[model_name].set_params(**kwargs[model_name])
+        elif model_name in model_codes.CLASSIFICATION_MODELS:
+            self.models = None
+            self.model = model_codes.CLASSIFICATION_MODELS[model_name]()
+            self.model.set_params(**kwargs)
+        else:
+            msg = "{} is an invalid classifier"
+            raise ValueError(msg.format(model_name))
+
+        self.model_type = model_codes.CLASSIFICATION_MODEL_TYPE
+
+    def define_model(self, model_type, model_name, **kwargs):
+        """
+        Define a model of a given type by name
+        :param model_type:  str model type
+        :param model_name:  str model name
+        :param kwargs:      dict kwargs for constructor
+        :raise:             ValueError
+        """
+        constructors_by_type = {
+            model_codes.REGRESSION_MODEL_TYPE: self.define_regressor,
+            model_codes.CLASSIFICATION_MODEL_TYPE: self.define_classifier
+        }
+
+        constructor = constructors_by_type.get(model_type, None)
+
+        if constructor is None:
+            msg = 'Invalid model_type {}; Valid model_types {}'
+            raise ValueError(msg.format(model_type, ", ".join(model_codes.MODEL_TYPES)))
+
+        constructor(model_name, **kwargs)
+
+    def split_random(self, x, y, train_ratio=0.8, random_state=None, check_index=False):
+        """
+        Split data into testing and training randomly
+        Make sure x and y have the same indexes
+        :param x: DataFrame, feature matrix.
+        :param y: Series, target vector.
+        :param train_ratio: float, the proportion used for the training set. The remaining will be
+                            used for testing set.
+        :param random_state: random seed.
+        :param check_index: bool, check if indices of x and y match
+        :raise ValueError:
+        :return: xtrain, ytrain, xtest, ytest
+        """
+        if check_index:
+            if not np.array_equal(x.index, y.index):
+                raise ValueError("Indices of x and y don't match!")
+        elif len(x) != len(y):
+            raise ValueError("x and y don't have the same length!")
+
+        if not x.index.is_unique or not y.index.is_unique:
+            x = x.reset_index(drop=True)
+            y = y.reset_index(drop=True)
+
+        log_fun_info(logger)
+
+        if random_state is not None:
+            np.random.seed(random_state)
+
+        new_index = np.random.permutation(x.index)
+        xtemp = x.reindex(new_index)
+        ytemp = y.reindex(new_index)
+
+        xtrain = xtemp[:int(len(xtemp) * train_ratio)]
+        xtest = xtemp[int(len(xtemp) * train_ratio):]
+        ytrain = ytemp[:int(len(ytemp) * train_ratio)]
+        ytest = ytemp[int(len(ytemp) * train_ratio):]
+        return xtrain, ytrain, xtest, ytest
+
+    def split_by_value(self, x, y, ref, test_value, check_index=False):
+        """
+        Split data into testing and training by test set value
+        Make sure x, y and ref have the same indices
+        :param x: DataFrame, feature matrix.
+        :param y: Series, target vector.
+        :param ref: Series, the column to split on (as the reference column).
+        :param test_value: the value for testing data.
+        :param check_index: bool, check if indices of x, y and ref match.
+        :raise ValueError:
+        :return: xtrain, ytrain, xtest, ytest
+        """
+        if check_index:
+            if not np.array_equal(x.index, y.index):
+                raise ValueError("Indices of x and y don't match!")
+            if not np.array_equal(x.index, ref.index):
+                raise ValueError("Indices of x and ref don't match!")
+        else:
+            if len(x) != len(y):
+                raise ValueError("x and y don't have the same length!")
+            if len(x) != len(ref):
+                raise ValueError("ref does not have the same length as x or y!")
+
+        log_fun_info(logger)
+
+        xtrain = x[ref != test_value]
+        xtest = x[ref == test_value]
+        ytrain = y[ref != test_value]
+        ytest = y[ref == test_value]
+        return xtrain, ytrain, xtest, ytest
+
+    def split_by_values(self, x, y, ref, train_values=None, test_values=None, check_index=False):
+        """
+        Split data into testing and training by subset of values
+        Make sure x, y and ref have the same indices
+        :param x: DataFrame, feature matrix.
+        :param y: Series, target vector.
+        :param ref: Series, the column to split on (as the reference column).
+        :param train_values: list, the set of values that training set belong to, if None then
+                             test_values will be used (train_values and test_values can't both be None).
+        :param test_values: list, the set of values that testing set belong to, if None then
+                            train_values will be used (train_values and test_values can't both be None).
+        :param check_index: bool, check if indices of x, y and ref match.
+        :raise ValueError:
+        :return: xtrain, ytrain, xtest, ytest
+        """
+        if check_index:
+            if not np.array_equal(x.index, y.index):
+                raise ValueError("Indices of x and y don't match!")
+            if not np.array_equal(x.index, ref.index):
+                raise ValueError("Indices of x and ref don't match!")
+        else:
+            if len(x) != len(y):
+                raise ValueError("x and y don't have the same length!")
+            if len(x) != len(ref):
+                raise ValueError("ref does not have the same length as x or y!")
+
+        if train_values is None and test_values is None:
+            raise ValueError("'train_values' and 'test_values' can't be both None.")
+
+        log_fun_info(logger)
+
+        if train_values is None:
+            train_values = np.setdiff1d(ref.unique(), test_values)
+        if test_values is None:
+            test_values = np.setdiff1d(ref.unique(), train_values)
+
+        train_values = list(train_values)
+        test_values = list(test_values)
+
+        xtrain = x[ref.map(lambda x: x in train_values)]
+        xtest = x[ref.map(lambda x: x in test_values)]
+        ytrain = y[ref.map(lambda x: x in train_values)]
+        ytest = y[ref.map(lambda x: x in test_values)]
+        return xtrain, ytrain, xtest, ytest
+
+    def split_by_values_with_threshold(self, x, y, ref, threshold=0.7, check_index=False):
+        """
+        Split data into training and testing by threshold percentage on ascending order
+        Make sure x, y and ref have the same indices
+        :param x: DataFrame, feature matrix.
+        :param y: Series, target vector.
+        :param ref: Series, the column to split on (as the reference column).
+        :param threshold: float, values below threshold go to train, otherwise go to test.
+        :param check_index: bool, check if indices of x, y and ref match.
+        :raise ValueError:
+        :return: xtrain, ytrain, xtest, ytest
+        """
+        if check_index:
+            if not np.array_equal(x.index, y.index):
+                raise ValueError("Indices of x and y don't match!")
+            if not np.array_equal(x.index, ref.index):
+                raise ValueError("Indices of x and ref don't match!")
+        else:
+            if len(x) != len(y):
+                raise ValueError("x and y don't have the same length!")
+            if len(x) != len(ref):
+                raise ValueError("ref does not have the same length as x or y!")
+
+        if threshold > 1 or threshold < 0:
+            raise ValueError("'threshold has to be between 0 and 1")
+
+        log_fun_info(logger)
+        cut_point = ref.quantile(q=threshold)
+
+        xtrain = x[ref <= cut_point]
+        xtest = x[ref > cut_point]
+        ytrain = y[ref <= cut_point]
+        ytest = y[ref > cut_point]
+        return xtrain, ytrain, xtest, ytest
+
+    def up_sample(self, xtrain, ytrain, neg_val=None, fold=1, check_index=False):
+        """
+        Brutal force up sampling the negative class
+        Make sure xtrain and ytrain have the same indexes
+        :param xtrain: DataFrame, the feature matrix.
+        :param ytrain: Series, the target vector.
+        :param neg_val: value for the negative class. If None, then neg_val will be the
+            derived from value counts.
+        :param fold: int, the number of folds to up sample.
+        :param check_index: bool, check if indices of xtrain and ytrain match.
+        :raise ValueError:
+        :return: xtrain, ytrain
+        """
+        if check_index:
+            if not np.array_equal(xtrain.index, ytrain.index):
+                raise ValueError("Indices of xtrain and ytrain don't match!")
+        elif len(xtrain) != len(ytrain):
+            raise ValueError("xtrain and ytrain do not have the same length!")
+
+        log_fun_info(logger)
+
+        vc = ytrain.value_counts()
+        if len(vc) > 2:
+            raise ValueError("Not a two class problem!")
+        if neg_val is None:
+            neg_val = vc.index[1]
+        xtrain_up_sample = xtrain.ix[ytrain == neg_val]
+        ytrain_up_sample = ytrain.ix[ytrain == neg_val]
+        for _ in range(fold):
+            xtrain = pd.concat([xtrain, xtrain_up_sample], axis=0)
+            ytrain = pd.concat([ytrain, ytrain_up_sample], axis=0)
+        return xtrain, ytrain
+
+    def fit_model(self, xtrain, ytrain, indep_cols, sample_weights=None, check_index=False):
+        """
+        Fit the model
+        Make sure xtrain, ytrain and sample_weights have the same indices
+        :param xtrain: DataFrame, training data.
+        :param ytrain: Series, the target vector.
+        :param indep_cols: list, the set of column names to build the model.
+        :param sample_weights: Series, column to use as sample weights to fit the model.
+        :param check_index: bool, check if indices of xtrain, ytrain and sample_weights match.
+        :raise ValueError:
+        """
+        if check_index:
+            if not np.array_equal(xtrain.index, ytrain.index):
+                raise ValueError("Indices of xtrain and ytrain don't match!")
+            if (sample_weights is not None) and (not np.array_equal(xtrain.index, sample_weights.index)):
+                raise ValueError("Indices of xtrain and sample_weights don't match!")
+        else:
+            if len(xtrain) != len(ytrain):
+                raise ValueError("xtrain and ytrain do not have the same length!")
+            if sample_weights is not None and len(ytrain) != len(sample_weights):
+                raise ValueError("sample_weights does not have the same length as xtrain/ytrain!")
+
+        log_fun_info(logger)
+
+        if not hasattr(ytrain, 'name') or ytrain.name is None:
+            self.target_name = 'y'
+        else:
+            self.target_name = ytrain.name
+
+        dummy_indep_cols = [col for col in xtrain.columns if col.split("___")[0] in indep_cols]
+        self.indep_cols = indep_cols
+        self.dummy_indep_cols = dummy_indep_cols
+
+        if sample_weights is not None:
+            if 'sample_weight' not in inspect.getargspec(self.model.fit).args:
+                raise ValueError("The model fit method has no argument 'sample_weight'!")
+
+            self.model.fit(xtrain[dummy_indep_cols], np.ravel(ytrain), sample_weights)
+        else:
+            self.model.fit(xtrain[dummy_indep_cols], np.ravel(ytrain))
+
+    def predict(self, xtest, return_proba=False, pos_label=None, min_proba_for_pos=None):
+        """
+        Make Predictions
+        :param xtest: panda Data Frame, testing data.
+        :param return_proba: bool, whether to write predicted probability into the output file.
+                             Only applies to classification problem.
+        :param pos_label: positive label. Only applies to two-class problem.
+        :param min_proba_for_pos: float, probability cut-off for positive class. Only applies for two-
+                                  class problems.
+        :raise ValueError:
+        :return: if not return_proba, returns a panda Series with predictions; else, returns both
+                 prediction and predicted probabilities.
+        """
+        if self.model_type is None:
+            raise ValueError('Model is not defined!')
+
+        if return_proba and not hasattr(self.model, 'predict_proba'):
+            raise ValueError("The model has no method named 'predict_proba(X)'!")
+
+        if not hasattr(self, 'dummy_indep_cols'):
+            raise ValueError("You haven't fit any model yet!")
+
+        log_fun_info(logger)
+
+        xtest = xtest.reindex(columns=self.dummy_indep_cols, fill_value=0)
+
+        if self.model_type == model_codes.REGRESSION_MODEL_TYPE:
+            predicted = pd.Series(self.model.predict(xtest), xtest.index, name='Predicted ' + self.target_name)
+            return predicted
+        elif self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+            classes = self.model.classes_
+            n_class = len(classes)
+
+            if n_class == 2 and min_proba_for_pos is not None and pos_label is not None:
+
+                if pos_label not in classes:
+                    raise ValueError('{} is not a valid positive label'.format(pos_label))
+
+                predicted_proba = pd.DataFrame(self.model.predict_proba(xtest), columns=classes, index=xtest.index)
+
+                neg_label = list(filter(lambda x: x != pos_label, classes))[0]
+                predicted = predicted_proba[pos_label].map(lambda x: pos_label if x >= min_proba_for_pos
+                                                           else neg_label)
+                predicted.name = 'Predicted ' + self.target_name
+            else:
+                predicted = pd.Series(self.model.predict(xtest), name='Predicted ' + self.target_name, index=xtest.index)
+                if return_proba:
+                    predicted_proba = pd.DataFrame(self.model.predict_proba(xtest), index=xtest.index, columns=classes)
+
+            if return_proba:
+                if n_class == 2 and min_proba_for_pos is not None and pos_label is not None:
+                    predicted_proba.drop([neg_label], axis=1, inplace=True)
+                predicted_proba.columns = ['Confidence: ' + str(x) for x in list(predicted_proba.columns)]
+                return predicted, predicted_proba
+            else:
+                return predicted
+        else:
+            raise ValueError("Model type '{}' is invalid!".format(self.model_type))
+
+    def get_metric(self, ytrue, ypred, metric, check_index=False, **kwargs):
+        """
+        Generates sklearn metric for a single metric code
+        :param ytrue:           Series, labelled testing data
+        :param ypred:           Series, predicted values
+        :param metric:          metric code
+        Options include:
+            regression:
+                r2:             r2_score (default)
+                meae:           median_absolute_error
+                mse:            mean_squared_error
+                mae:            mean_absolute_error
+                evs:            explained_variance_score
+            classification:
+                accuracy:       accuracy_score (default)
+                f1:             f1_score
+                log_loss:       log_loss
+                precision:      precision_score
+                recall:         recall_score
+                prfs:           precision_recall_fscore_support
+                confusion:      confusion_matrix
+        :param check_index:     bool, check if indices of ytrue and ypred match
+        :raise ValueError:      Multiple validation conditions defined below
+        :return:                Return the performance metric value
+        """
+        if check_index:
+            if not np.array_equal(ytrue.index, ypred.index):
+                raise ValueError("Indices of ytest and ypred don't match!")
+
+        # NOTE: No need for this extra step; evaluating the metric will already do this
+        elif len(ytrue) != len(ypred):
+            raise ValueError("ytest and ypred don't have the same length!")
+
+        self._check_model_type()
+
+        if metric not in metric_codes.METRICS_BY_TYPE[self.model_type]:
+            raise ValueError("Invalid metric '{}' for model type '{}'!".format(metric, self.model_type))
+
+        return metric_codes.METRICS_BY_TYPE[self.model_type][metric](ytrue, ypred, **kwargs)
+
+    def get_metrics(self, ytrue, ypred, metric_list=None, check_index=False, **kwargs):
+        """
+        Generates sklearn metrics for a multiple metric codes
+        :param ytrue:           Series, labelled testing data
+        :param ypred:           Series, predicted values
+        :param metric_list:     list of metric codes
+        :param check_index:     bool, check if indices of ytrue and ypred match
+        :return:                dict of performance metric value by metric code names
+        :raise ValueError:      Multiple validation conditions defined below
+        """
+        if check_index:
+            if not np.array_equal(ytrue.index, ypred.index):
+                raise ValueError("Indices of ytest and ypred don't match!")
+
+        # NOTE: No need for this extra step; evaluating the metric will already do this
+        elif len(ytrue) != len(ypred):
+            raise ValueError("ytest and ypred don't have the same length!")
+
+        self._check_model_type()
+
+        return reduce(
+            lambda x, metric: merge_dict(
+                x,
+                {metric: self.get_metric(ytrue, ypred, metric, **kwargs.get(metric, {}))}
+            ),
+            metric_list,
+            {}
+        )
+
+    def eval_model(self, ytrue, ypred, metric_list=None, check_index=False, **kwargs):
+        """
+        Evaluate model performance
+        Generates sklearn metrics
+        :TODO:  Deprecate
+        :param ytrue:           Series, testing data.
+        :param ypred:           Series, predicted values.
+        :param metric_list:     str or list of metric codes
+        :param check_index:     bool, check if indices of ytrue and ypred match.
+        :raise ValueError:      Multiple validation conditions defined below
+        :return:                Return the performance score(s)
+        """
+        if check_index:
+            if not np.array_equal(ytrue.index, ypred.index):
+                raise ValueError("Indices of ytest and ypred don't match!")
+        elif len(ytrue) != len(ypred):
+            raise ValueError("ytest and ypred don't have the same length!")
+
+        if metric_list is None:
+            if self.model_type is None:
+                raise ValueError("Define a model first!")
+            elif self.model_type == model_codes.REGRESSION_MODEL_TYPE:
+                metric_list = [metric_codes.R2]
+            elif self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+                metric_list = [metric_codes.ACCURACY]
+            else:
+                raise ValueError("Model type '{}' is invalid!".format(self.model_type))
+
+        log_fun_info(logger)
+
+        # NOTE: Preserved for backwards compatibility; Can use get_metric with string also
+        if isinstance(metric_list, str):
+            metric_list = [metric_list]
+
+        # NOTE: Preserved for backwards compatibility; Can use get_metric with string also
+        if len(metric_list) < 2:
+            return self.get_metric(ytrue, ypred, metric_list[0], **kwargs)
+
+        return self.get_metrics(ytrue, ypred, metric_list, **kwargs)
+
+    def score_proba(self, ytrue, proba, metric=None, check_index=False, **kwargs):
+        """
+        Score based on predicted probabilities
+        :param ytrue:       array, 0 or 1 valued, can have multiple columns.
+        :param proba:       array, same shape as ytrue.
+        :param metric:      str or list, metric(s) to use.
+        Options:
+            auc:            roc_auc_score
+            aps:            average_precision_score
+            roc_curve:      roc_curve
+            pr_curve:       precision_recall_curve
+        :param check_index: bool, check if indices match.
+        :raise ValueError:  exceptions documented below
+        :return:            metric(s)
+        """
+        if check_index:
+            if not np.array_equal(ytrue.index, proba.index):
+                raise ValueError("Indices of ytest and ypred don't match!")
+        elif len(ytrue) != len(proba):
+            raise ValueError("ytest and ypred don't have the same length!")
+
+        if self.model_type != model_codes.CLASSIFICATION_MODEL_TYPE:
+            raise ValueError("clf_score only works for classification problem!")
+
+        metric_map = {'auc': 'roc_auc_score',
+                      'aps': 'average_precision_score',
+                      'roc_curve': 'roc_curve',
+                      'pr_curve': 'precision_recall_curve'}
+
+        log_fun_info(logger)
+
+        if isinstance(metric, str):
+            metric = [metric]
+
+        res = []
+        for m in metric:
+            if m not in metric_map:
+                raise ValueError("Invalid Metric!")
+
+            if len(metric) == 1:
+                res.append(getattr(metrics_, metric_map[m])(ytrue, proba, **kwargs))
+            elif m in kwargs:
+                res.append(getattr(metrics_, metric_map[m])(ytrue, proba, **kwargs[m]))
+            else:
+                res.append(getattr(metrics_, metric_map[m])(ytrue, proba))
+
+        if len(res) == 1:
+            return res[0]
+        else:
+            return tuple(res)
+
+    def cross_validation(self, xtrain, ytrain, metric, fold=None, n_jobs=-1, fit_params=None, check_index=False):
+        """cross validation
+        :param xtrain: DataFrame, training data.
+        :param ytrain: Series, target column.
+        :param metric: str, metric to score performance. Options include
+            regression:
+                'r2': 'r2_score'
+                'meae': 'median_absolute_error'
+                'mse': 'mean_squared_error'
+                'mae': 'mean_absolute_error'
+                'evs': 'explained_variance_score'
+            classification:
+                'f1': 'f1_score'
+                'log_loss': 'log_loss'
+                'precision': 'precision_score'
+                'recall': 'recall_score'
+                'accuracy': 'accuracy_score'
+                'prfs': 'precision_recall_fscore_support'
+                'confusion': 'confusion_matrix'
+        :param fold: int, # of folds.
+        :param n_jobs: int, n_jobs for parallelization
+        :param fit_params: dict, parameters to fit model.
+        :param check_index: bool, check if indices match.
+        :raise ValueError:
+        :return: list of performance scores for each fold.
+        """
+        if check_index:
+            if not np.array_equal(xtrain.index, ytrain.index):
+                raise ValueError("Indices of ytest and ypred don't match!")
+        elif len(xtrain) != len(ytrain):
+            raise ValueError("ytest and ypred don't have the same length!")
+
+        return cross_val_score(self.model, xtrain, ytrain,
+                               scoring=CROSS_VALIDATION_METRIC_MAP[metric],
+                               cv=fold,
+                               n_jobs=n_jobs,
+                               fit_params=fit_params)
+
+    def check_feature_importance(self, group=False):
+        """
+        Check feature importance
+        :param group:       bool whether to group the categorical dummies.
+        :param result_path: str file path to store the output.
+        :raise ValueError:
+        :return:            the feature importance table
+        """
+        if not hasattr(self, 'dummy_indep_cols'):
+            raise ValueError("You haven't fit any model yet!")
+
+        if not hasattr(self.model, 'feature_importances_'):
+            raise ValueError("Model does not have attribute 'feature_importance_'!")
+
+        log_fun_info(logger)
+
+        feature_importance = pd.DataFrame([self.model.feature_importances_, self.dummy_indep_cols]).T
+        feature_importance.columns = ['score', 'feature']
+        feature_importance['score'] = feature_importance['score'].astype('float')
+        feature_importance = feature_importance.sort_values('score', ascending=False)
+
+        if group:
+            feature_importance['feature'] = feature_importance['feature'].map(lambda x: x.split('___')[0])
+            feature_importance = feature_importance.groupby('feature')['score'].agg(['mean', 'count', 'sum'])
+            feature_importance = feature_importance.sort_values('sum', ascending=False)
+            feature_importance = feature_importance.reset_index()
+
+        return feature_importance
+
+    def get_feature_importances(self, residuals, xtrain, ytrain):
+        """
+        Feature Importance method used by Opal
+        :param residuals:   array residuals (y - y^)
+        :param xtrain:      int number of features
+        :param ytrain:      int sample size
+        :return:            pd.DataFrame feature importance table
+        """
+        feature_importances = None
+
+        # Non-linear models:
+        #   Accumulate feature importance through gradient descent while training
+        if hasattr(self.model, 'feature_importances_'):
+            feature_importances = model_helpers.feature_importance_table(
+                self.model.feature_importances_,  # What guarantees these are in the same order?
+                self.dummy_indep_cols,
+                group=True
+            )
+
+        # Linear models:
+        #   Try:  To calculate p-Values for each regressor
+        #   Else: Use stepwise correlation based variable importance
+        elif isinstance(self.model, LinearModel):
+            # feature_importances = pd.DataFrame()
+            coef_stats = OrderedDict((
+                ('Feature', xtrain.columns),
+                ('Co-Efficient', self.model.coef_),
+            ))
+            try:
+                df = float(xtrain.shape[0] - xtrain.shape[1] - 1)
+                sse = np.sum(residuals ** 2, axis=0) / df
+                se = np.sqrt(np.diagonal(sse * np.linalg.inv(np.matrix(np.dot(xtrain.T, xtrain), dtype=np.float))))
+                self.model.t_stats = self.model.coef_ / se
+                # Two-sided test
+                self.model.p_values = 2 * (
+                    1 - stats.t.cdf(np.abs(self.model.t_stats), df)
+                )
+                coef_stats.update(OrderedDict((
+                    ('t-Statistic', self.model.t_stats),
+                    ('p-Value', self.model.p_values)
+                )))
+            except np.linalg.linalg.LinAlgError:
+                f_scores, p_values = sklearn.feature_selection.f_regression(
+                    X=xtrain[self.dummy_indep_cols],
+                    y=ytrain,
+                    center=True
+                )
+                self.model.f_values = f_scores
+                self.model.p_values = p_values
+                coef_stats.update(OrderedDict((
+                    ('F-Score', self.model.f_values),
+                    ('p-Value', self.model.p_values)
+                )))
+
+            table_data = pd.DataFrame(coef_stats)
+            return table_data.sort_values('p-Value', ascending=True)
+
+        if feature_importances is not None:
+            _columns = ['feature', 'dummies', 'percent_contribution']
+            subset = feature_importances[_columns]
+            feature_importances = subset.rename(
+                columns={
+                    'feature': 'Feature',
+                    'dummies': 'Number of Dummies',
+                    'percent_contribution': 'Percent Contribution'
+                }
+            )
+
+        return feature_importances
+
+    def fit_predict(self, xtrain, ytrain, xtest, indep_cols,
+                    sample_weights=None,
+                    groupby=None,
+                    return_proba=False,
+                    pos_label=None,
+                    min_proba_for_pos=None,
+                    check_index=True):
+        """
+        Single model single test
+        :param xtrain:              DataFrame, xtrain
+        :param ytrain:              Series, ytrain
+        :param xtest:               DataFrame, xtest
+        :param indep_cols:          list, the set of column names to build the model.
+        :param sample_weights:      Series, column to use as sample weight to fit the model.
+        :param groupby:             Series, column to group by. Contains indexes for both train and test.
+        :param min_proba_for_pos:   float, probability cut-off for positive class.
+                                    Only applies for two-class problems.
+        :param return_proba:        bool, whether to write predicted probability into the output file.
+        :param pos_label:           str, positive label.
+        :param check_index:         bool, check if xtrain, ytrain, sample_weights match, and if xtest and ytest match.
+        :raise:                     ValueError
+        :return:                    model performance, specified by 'return_type'.
+        """
+
+        log_fun_info(logger)
+
+        if groupby is not None:
+            groupby_train = groupby.ix[xtrain.index]
+            groupby_test = groupby.ix[xtest.index]
+            pred, proba = pd.DataFrame(), pd.DataFrame()
+            split_vals = groupby.unique()
+            for val in split_vals:
+                xtrain_subset = xtrain[groupby_train == val]
+                xtest_subset = xtest[groupby_test == val]
+                ytrain_subset = ytrain[groupby_train == val]
+                if sample_weights is not None:
+                    sample_weights_subset = sample_weights[groupby_train == val]
+                else:
+                    sample_weights_subset = None
+                self.fit_model(xtrain_subset, ytrain_subset, indep_cols, sample_weights_subset, check_index)
+
+                if return_proba:
+                    pred_sub, proba_sub = self.predict(xtest_subset, True, pos_label, min_proba_for_pos)
+                    pred, proba = pd.concat([pred, pred_sub], axis=1), pd.concat([proba, proba_sub], axis=1)
+                else:
+                    pred_sub = self.predict(xtest_subset, False, pos_label, min_proba_for_pos)
+                    pred = pd.concat([pred, pred_sub], axis=1)
+
+            pred = pred.reindex(xtest.index)
+            if return_proba:
+                proba = proba.reindex(xtest.index)
+                proba.fillna(0, inplace=True)
+                return pred, proba
+            return pred
+        else:
+            self.fit_model(xtrain, ytrain, indep_cols, sample_weights, check_index)
+            return self.predict(xtest, return_proba, pos_label, min_proba_for_pos)
+
+    def model_comparison(self, xtrain, ytrain, xtest, ytest, indep_cols,
+                         model_list='all',
+                         sample_weights=None,
+                         groupby=None,
+                         pos_label=None,
+                         min_proba_for_pos=None,
+                         metric=None,
+                         check_index=False,
+                         **metric_params):
+        """Multiple model comparisons using single test.
+        :param xtrain: DataFrame, xtrain
+        :param ytrain: Series, ytrain
+        :param xtest: DataFrame, xtest
+        :param ytest: Series, ytest
+        :param indep_cols: list, the set of column names to build the model.
+        :param model_list: list, the set of model names to apply.
+        :param sample_weights: Series, column to use as sample weight to fit the model.
+        :param min_proba_for_pos: float, probability cut-off for positive class. Only applies for two-
+                                  class problems.
+        :param metric: str, metric to score performance. Options include
+            regression:
+                'r2': 'r2_score'
+                'meae': 'median_absolute_error'
+                'mse': 'mean_squared_error'
+                'mae': 'mean_absolute_error'
+                'evs': 'explained_variance_score'
+            classification:
+                'f1': 'f1_score'
+                'log_loss': 'log_loss'
+                'precision': 'precision_score'
+                'recall': 'recall_score'
+                'accuracy': 'accuracy_score'
+                'prfs': 'precision_recall_fscore_support'
+                'confusion': 'confusion_matrix'
+        :param metric_params: dict, additional parameters for the metric method.
+        :param groupby: column name, fit the model group by the column.
+        :param pos_label: str, positive label.
+        :param check_index: bool, check if xtrain, ytrain, sample_weights match, and if xtest and
+            ytest match.
+        :raise ValueError:
+        :return: str, model settings and F1 scores.
+        """
+        if self.models is None:
+            raise ValueError("Models are not defined!")
+
+        log_fun_info(logger)
+
+        if model_list == 'all':
+            model_list = self.models.keys()
+
+        res = {}
+        for model_name in model_list:
+            self.model = self.models[model_name]
+
+            pred = self.fit_predict(xtrain, ytrain, xtest, indep_cols, sample_weights, groupby,
+                                    False, pos_label, min_proba_for_pos, check_index)
+
+            res[model_name] = self.eval_model(ytest, pred, metric, check_index, **metric_params)
+        return res
+
+    def dim_reduction(self, mld, exclude_cols=[], n_components=2, model='pca', inplace=True):
+        """Dimension reduction using PCA or ICA.
+        :param mld: MachineLearningData object. Note that MLD should contain dummy data.
+        :param exclude_cols: list, the set of column names to exclude from dimension reduction. Note
+                            that the exclude set would still be included in the resulting data.
+        :param n_components: int, the number of components resulting from dimension reduction.
+        :param model: 'pca' or 'ica'.
+        :param inplace: bool, whether to alter the data inplace or not.
+        :raise ValueError:
+        :return: if inplace == False, return the data frame; else None.
+        """
+        log_fun_info(logger)
+
+        if model == 'pca':
+            drm = PCA(n_components)
+        elif model == 'ica':
+            drm = FastICA(n_components)
+        else:
+            raise ValueError("Model input is invalid!")
+        indep_cols = mld.data.columns.difference(exclude_cols)
+        temp = pd.DataFrame(drm.fit_transform(mld.data[indep_cols]), index=mld.data.index,
+                            columns=[model + str(x) for x in range(n_components)])
+        if inplace:
+            mld.data = pd.concat([mld.data[exclude_cols], temp], axis=1)
+        else:
+            return pd.concat([mld.data[exclude_cols], temp], axis=1)
+
+        # TODO:
+        # mlmodel.decision_tree_plot needs to be analyzed; it produces binary of .png not file
+        # Description is no longer accurate
+
+    def decision_tree_plot(self, format='svg', return_dot=False):
+        """Generate image file or binary with specificed format for decision tree plot.
+        :param format: str, svg, png, jpg, etc
+        :param return_dot: bool, return dot file or not
+        :return: image_binary
+        """
+        if not hasattr(self, 'dummy_indep_cols'):
+            self.__raise_value_error("You haven't fit any model yet!")
+
+        def change_x(match):
+            """inline function
+            :param match: the match object from re.
+            :return: r
+            """
+            return self.__change_x(match, self.dummy_indep_cols)
+
+        tree_dot = tree.export_graphviz(self.model, out_file=None, special_characters=True)
+
+        # write_obj_to_file('test', 'graphviz_raw.log', tree_dot)  # DELETE AFTER TEST
+        # Cut value from label in intermediate nodes
+        tree_dot = re.sub(r'(\[label=<X<SUB>[\d]+<\/SUB>.*)<br\/>value = \[[^\]]*\]([^\]])*', r'\1\2', tree_dot)
+        # Add formatting to lables in intermediate nodes
+        tree_dot = re.sub(
+            r'(label=<X<SUB>[\d]+<\/SUB>[^\]]*samples = [\d]+>)',
+            r'\1, style="rounded, filled", color="#eaeaea"',
+            tree_dot
+        )
+
+        if self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+            # Change leaf name to match index from model classes
+            tree_dot = re.sub(r'(\[label[^\]]*)value = \[\s*(.*?)\s*\]([^\]]*)', self.__change_tree_leaf, tree_dot)
+            # Same as bavoe but for case of leaf name change where value is not array in brackets
+            tree_dot = re.sub(r'(\[label[^\]]*)value = \s*(.*?)\s*([^\]]*)', self.__change_tree_leaf, tree_dot)
+        else:
+            tree_dot = re.sub('value', 'average', tree_dot)
+
+        # Adds coloration for yes / no path
+        tree_dot = re.sub(r"([\d]+)\s*->\s*([\d]+).*;", self.__change_a_tree_arrow, tree_dot)
+        # Translate <= to Not Equal; > to Equal; changed to %le; and %gt;
+        tree_dot = re.sub(r'X<SUB>(\d+)<\/SUB>( (\&le\;|\&gt\;) [\d.-]+)', change_x, tree_dot)
+        # Escape any html unsafe characters from change_x substitution
+
+        if return_dot:
+            return tree_dot
+
+        # write_obj_to_file('test', 'graphviz_formatted.log', tree_dot)  # DELETE AFTER TEST
+        env = {
+            "PATH": os.pathsep.join([
+                GRAPHVIZ_UNIX_DIR,
+                os.environ["PATH"]
+            ])
+        }
+
+        src = MLSource(tree_dot, format=format)
+        image_binary = src.pipe(env=env)
+        return image_binary
+
+    def __change_tree_leaf(self, match):
+        """Helper function for decision_tree_plot. Change the display of leaf nodes.
+        :param match: the match object from re.
+        :return: modified dot string.
+        """
+        sample_ct = re.split('\D+', match.group(2).strip().replace('.', ''))
+        s = match.group(1)
+        for i in range(len(sample_ct)):
+            if i % 2 == 0 and i > 0:
+                s += '<br/>'
+            s += ' ' + str(self.model.classes_[i]) + ' = ' + str(sample_ct[i]) + ' '
+        return s + match.group(3) + ', style="rounded, filled", color="#b3e0ff"'
+
+    def __change_a_tree_arrow(self, match):
+        """Helper function for decision_tree_plot. Change the display of arrows.
+        :param match: the match object from re.
+        :return: modified dot string.
+        """
+        if (int(match.group(1)) + 1 == int(match.group(2))):
+            result = match.group(1) + " -> " + match.group(
+                2) + ' [label=No, color="#FF0000", fontcolor="#FF0000"] ;'
+        else:
+            result = match.group(1) + " -> " + match.group(2) + ' [label=Yes, color=green, fontcolor="#00cc00"] ;'
+        return result
+
+    def __change_x(self, match, columns):
+        """Helper function for decision_tree_plot.
+        :param match: the match object from re.
+        :param columns: list, the set of dummy column names used to build the tree.
+        :return: modified variable names.
+        """
+        i = int(match.group(1))  # id
+        # op = match.group(3)  # < or >
+        s = match.group(2)
+        if columns[i].find('___') != -1:
+            items = columns[i].split('___')
+            #             if op == '<' or op == '<=':
+            #                 return items[0] + ' != ' + items[1]
+            #             else:
+            return ' = '.join(map(html.escape, (items[0], items[1])))
+        else:
+            s = s.replace("&le;", "&gt;")  # TODO: Wait what? Why are inverting the logic?
+            return columns[i] + s
+
+    def build_leaf_path(self, dtypes):
+        """For decision tree only.
+        Traverse the tree in DFS fashion for each leaf node and return a data frame, with each
+        row being the path of a leaf and each column corresponding a feature. The order of the path
+        is ignored. Multiple encounters of the same feature in one path are combined.
+        :param dtypes: dict, data types.
+        :raise ValueError:
+        :return: data frame containing the paths.
+        """
+        if not hasattr(self, 'dummy_indep_cols'):
+            raise ValueError("You haven't fit any model yet!")
+
+        log_fun_info(logger)
+        empty_path = self.__init_empty_path(dtypes)
+        res = []
+        self.__recur_path(0, empty_path, res)
+        if self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+            result = pd.DataFrame(res, columns=list(self.model.classes_) + ['Purity', 'Purity*Size', 'Factors'])
+            result.sort_values('Purity*Size', ascending=False, inplace=True)
+        else:
+            result = pd.DataFrame(res, columns=['Average', 'Size', self.model.criterion.capitalize(), 'Factors'])
+            result.sort_values('Size', ascending=True, inplace=True)
+
+        # result.dropna(axis=1, how='all', inplace=True)
+        return result
+
+    def __recur_path(self, node_id, path, res):
+        """Helper function for build_leaf_path. recursively run for each node.
+        :param node_id: node id in sklearn decision tree tree_.
+        :param path: path to current node.
+        :param res: list to store the result.
+        """
+        right_node = self.model.tree_.children_right[node_id]
+        left_node = self.model.tree_.children_left[node_id]
+        columns = self.dummy_indep_cols
+        if right_node == -1:
+            if self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+                values = self.model.tree_.value[node_id][0]  # sample_ct for classification
+            else:
+                # average and n_sample for regression
+                values = list(self.model.tree_.value[node_id][0]) + [self.model.tree_.n_node_samples[node_id]]
+            impurity = self.model.tree_.impurity[node_id]
+            self.__save_path(values, impurity, path, res)
+        else:
+            dummy_id = self.model.tree_.feature[node_id]
+            dummy = columns[dummy_id]
+
+            right_path = copy.deepcopy(path)
+            left_path = copy.deepcopy(path)
+
+            if dummy.find("___") != -1:
+                column, category = dummy.split('___')
+                right_path[column]["="] = category
+                left_path[column]["!in"].append(category)
+            else:
+                threshold = self.model.tree_.threshold[node_id]
+                if path[dummy][">"] is None or path[dummy][">"] < threshold:
+                    right_path[dummy][">"] = threshold
+                if path[dummy]["<="] is None or path[dummy]["<="] > threshold:
+                    left_path[dummy]["<="] = threshold
+            self.__recur_path(right_node, right_path, res)
+            self.__recur_path(left_node, left_path, res)
+
+    def __init_empty_path(self, dtypes):
+        """Construct empty path.
+        :param dtypes: dict, the data types of independent columns.
+        :return: an empth path.
+        """
+        empty_path = {}
+        for column in self.indep_cols:
+            if dtypes[column] == 'category' or dtypes[column] == 'object':
+                empty_path[column] = {"=": None, "!in": []}
+            else:
+                empty_path[column] = {"<=": None, ">": None}
+        return empty_path
+
+    def __save_path(self, values, impurity, path, res):
+        """Save path of a leaf node to the list.
+        :param values: sample_ct for classification, average and n_samples for regression
+        :param impurity: impurity score.
+        :param path: the path to the leaf node.
+        :param res: list to store the result.
+        """
+        row = list(values)
+
+        if self.model_type == model_codes.CLASSIFICATION_MODEL_TYPE:
+            row.append(1 - impurity)
+            row.append((1 - impurity) * sum(values))
+        else:
+            row.append(impurity)
+
+        tokens = ""
+        for column in self.indep_cols:
+            if ">" in path[column]:
+                if path[column][">"] is not None and path[column]["<="] is not None:
+                    n1 = round(path[column][">"], 4)
+                    n2 = round(path[column]["<="], 4)
+                    tokens += "%s < %s <= %s; " % (n1, column, n2)
+                elif path[column]["<="] is not None:
+                    n2 = round(path[column]["<="], 4)
+                    tokens += "%s <= %s; " % (column, n2)
+                elif path[column][">"] is not None:
+                    n1 = round(path[column][">"], 4)
+                    tokens += "%s > %s; " % (column, n1)
+            else:
+                if path[column]["="] is not None:
+                    tokens += "{} = {}; ".format(column, path[column]["="])
+                elif len(path[column]["!in"]) > 0:
+                    if len(path[column]["!in"]) == 1:
+                        tokens += "{} != {}; ".format(column, path[column]["!in"][0])
+                    else:
+                        tokens += "{} not in {}; ".format(column, path[column]["!in"]).replace("'", "")
+        if len(tokens) > 0:
+            tokens = tokens[:-2]  # remove the last "; "
+        row.append(tokens)
+        res.append(row)
+
+
+
+
+'mltsclustering.py'
+"""
+HeadURL:  $HeadURL: https://svn.blackrock.com/public/teams/APSG/DataScience/mltemplate_/trunk/mldata.py $
+Last changed by:  $Author: bihan $
+Last changed on:  $Date: 2017-01-12 12:00:00 $
+
+(c)  2014 BlackRock.  All rights reserved.
+
+Description:
+
+Cluster time series.
+"""
+
+__version__ = '1.0'
+
+
+import os
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.covariance import MinCovDet
+from sklearn import svm
+import matplotlib.pyplot as plt
+from matplotlib import pylab
+plt.style.use('ggplot')
+from scipy.stats import entropy
+import itertools
+from mltemplate.config import init_logger, log_fun_info
+
+logger = init_logger(__name__, 'warn')
+
+
+class ClusterModel():
+    """Data clustering, plotting, generating exceptions
+    ***Class Attributes***
+    :py:attr:'self.data_original'(dataframe): the original return value for each jacket and its dimension information
+    :py:attr:'self.data_time'(dataframe): the return value for each portfolio and its belonging std group
+    :py:attr:'self.dim_info'(list): a list of column names that should be considered as dimension information
+    :py:attr:'self.time_list'(list): a list of datetime objects representing the time period
+    :py:attr:'self.saving_path'(string): directory path for saving result such as cluster information and exceptions
+    :py:attr:'self.plot_path'(string): directory path for saving plotting result
+    """
+
+    def __init__(self, saving_path=None):
+        '''Constructor.
+        :param saving_path: directory path for saving result, default value is None and will save the result in current directory
+        '''
+        log_fun_info(logger)
+        self.__get_path(saving_path)
+
+    def __raise_error(self, msg):
+        """raise error with designated message
+        :param msg: string the message
+        :raise ValueError: raise value error
+        """
+        logger.error(msg)
+        raise ValueError(msg)
+
+    def __get_path(self, saving_path=None):
+        """get the directory path and plot saving path
+        :param saving_path: saving path provided by user, default value is None, will use the current path
+        """
+        if saving_path is None:
+            cwd_path = os.getcwd()
+            self.saving_path = os.path.join(cwd_path, 'result')
+            try:
+                os.stat(self.saving_path)
+            except:
+                os.mkdir(self.saving_path)
+            plot_path = os.path.join(self.saving_path, 'cluster_plot')
+            try:
+                os.stat(plot_path)
+            except:
+                os.mkdir(plot_path)
+            self.plot_path = plot_path
+        else:
+            self.saving_path = saving_path
+            plot_path = os.path.join(saving_path, 'cluster_plot')
+            try:
+                os.stat(plot_path)
+            except:
+                os.mkdir(plot_path)
+            self.plot_path = plot_path
+
+    @staticmethod
+    def __kmeans_model(data, k, init_time=10, iter_time=300):
+        """apply kmeans clustering on data
+        :param data: data for clustering
+        :param k: number of clusters
+        :param init_time: times for initialization, default value is 10
+        :param iter_time: iteration times for Kmeans algorithm, default value is 300
+        :return kmeans: model
+        :return prediction: cluster id for each data point
+        """
+        kmeans = KMeans(init='k-means++', n_clusters=k, n_init=init_time, max_iter=iter_time)
+        kmeans.fit(data)
+        prediction = kmeans.predict(data)
+        return prediction
+
+    def cluster_model(self, data, n_clusters, n_clusters_group=[], group_clustering=False, init_time=10, iter_time=300):
+        """data clustering, will insert the cluster id in the original table
+        :param data:
+        :param n_clusters: number of clusters
+        :param n_clusters_group: number of clusters in each group
+        :param group_clustering: whether to cluster in each group, default value id True
+        :param init_time: number of times for initialization, default value is 10
+        :param iter_time: iteration times for Kmeans clustering
+        :return:
+        """
+        log_fun_info(logger)
+        cluster_label_series = []
+        if group_clustering:  # must contain 'std_group'
+            group_id = data['std_group'].unique()
+            group_id.sort()
+            if len(n_clusters_group) == 0:  # number of clusters in each group is not provided by user
+                cluster_num = round(n_clusters / float(len(group_id)))  # then n_clusters must be given
+                n_clusters_group = [cluster_num] * len(group_id)
+            else:
+                logger.warning('input n_clusters_group is not empty, ignored input n_clusters.')
+            n_clusters = sum(n_clusters_group)
+            self.n_clusters = n_clusters
+            self.n_clusters_group = n_clusters_group
+            if len(group_id) != len(self.n_clusters_group):
+                self.__raise_error('n_clusters_group must equal to the number of volatility groups.')
+            for i in range(len(group_id)):
+                # print('Clustering in group %d' % (group_id[i]))
+                data_temp = data[data['std_group'] == group_id[i]]
+                data_temp = data_temp.loc[:, ~data_temp.columns.isin(['robust_std', 'std_group', 'cluster_label'])]
+                prediction = self.__kmeans_model(data_temp, self.n_clusters_group[i], init_time, iter_time)
+                prediction = prediction + sum(self.n_clusters_group[0: i])
+                cluster_label_list = pd.DataFrame(prediction, index=data_temp.index, columns=['cluster_label'])
+                cluster_label_series.append(cluster_label_list)
+            cluster_label = pd.concat(cluster_label_series)
+            self.cluster_label = cluster_label
+            self.cluster_id_list = cluster_label['cluster_label'].unique().tolist()
+            logger.info('Finished clustering in %d volatility groups' % (len(self.n_clusters_group)))
+            return cluster_label
+        else:  # group in the whole dataset
+            # print('Clustering...')
+            data_temp = data.loc[:, ~data.columns.isin(['robust_std', 'std_group', 'cluster_label'])]
+            prediction = self.__kmeans_model(data_temp, n_clusters, init_time, iter_time)
+            cluster_label = pd.DataFrame(prediction, index=data_temp.index, columns=['cluster_label'])
+            self.cluster_label = cluster_label
+            self.cluster_id_list = cluster_label['cluster_label'].unique().tolist()
+            logger.info('Finished clustering in whole portfolio set.')
+            return cluster_label
+
+    def extract_info_from_cluster(self, label, data_time, cluster_label, data_dim=None):
+        """extract the return TS table and dimensional information table in a specific cluster
+        :param label: cluster id
+        :param data_time: time-series table
+        :param cluster_label: pandas series, contains the cluster lebel for each time series, should have same rows with data_time.
+        :param data_dim:
+        :return:
+        """
+        log_fun_info(logger)
+        index_slice = cluster_label[cluster_label == label].index.tolist()
+        index_slice = list(set(index_slice) & set(data_time.index.tolist()))
+        data_time_temp = data_time.loc[index_slice]
+        data_time_temp = data_time_temp.loc[:, ~data_time.columns.isin(['robust_std', 'std_group', 'cluster_label'])]
+        if not (data_dim is None):
+            data_dim_temp = data_dim.loc[index_slice]
+        else:
+            data_dim_temp = pd.DataFrame()
+        return data_time_temp, data_dim_temp
+
+    @staticmethod
+    def __robust_mean_std(x):
+        """calculate the robust mean, variance and std for a set of data
+        :param x: input array provided by user
+        :return location_robust: robust mean
+        :return: var_robust: robust variance; std_robust: robust standard deviation
+        """
+        mcd = MinCovDet()
+        try:
+            mcd.fit(x)
+        except ValueError:
+            return x.mean(), x.var(), x.std()
+        else:
+            mcd.fit(x)
+            location_robust = mcd.location_[0]
+            var_robust = mcd.covariance_[0][0]
+            std_robust = np.sqrt(var_robust)
+        return location_robust, var_robust, std_robust
+
+    def __cluster_robust_mean_std(self, data_time):
+        """calculate the movement of cluster centroid and its corresponding std band
+        :param data_time: return TS table for a cluster
+        :return: location_list: cluster centroid movement, square_error_list: cluster variance band,
+            std_list: cluster standard deviation band
+        """
+        location_list = []
+        square_error_list = []
+        std_list = []
+        for column in data_time.columns:
+            temp = data_time.loc[:, column]
+            temp = temp.values.reshape(-1, 1)
+            location, square_error, std = self.__robust_mean_std(temp)
+            location_list.append(location)
+            square_error_list.append(square_error)
+            std_list.append(std)
+        location_list = np.array(location_list).reshape(-1, 1)
+        square_error_list = np.array(square_error_list).reshape(-1, 1)
+        std_list = np.array(std_list).reshape(-1, 1)
+        return location_list, square_error_list, std_list
+
+    @staticmethod
+    def __remove_outlier_by_std(data_time, location, std, std_tol=3, outlier_tol=0.2):
+        """remove the outliers in the cluster by standard deviation band
+        :param data_time: return TS table provided by user
+        :param location: centroid of the cluster
+        :param std: standard deviation band
+        :param std_tol: std band threshold, default value is 2
+        :param outlier_tol: outlier threshold, default value is 0.2, which means outlier is over 20% of times out of 2 std band
+        :return: port_list: a list of portfolios which are not outliers
+        """
+        port_list = []
+        upper_bound = location + std_tol * std
+        lower_bound = location - std_tol * std
+        for index in data_time.index:
+            # print(data_time.loc[index].values.shape, upper_bound.shape)
+            # print(type(data_time.loc[index].values))
+            # print(type(upper_bound))
+
+            if (data_time.loc[index].values.shape == (upper_bound.shape[0],)):
+                # print("inconsistant")
+                upper_outlier = data_time.loc[index].values.reshape(-1, 1) > upper_bound
+                lower_outlier = data_time.loc[index].values.reshape(-1, 1) < lower_bound
+            else:
+                upper_outlier = data_time.loc[index].values[0, :].reshape(-1, 1) > upper_bound
+                lower_outlier = data_time.loc[index].values[0, :].reshape(-1, 1) < lower_bound
+
+            outlier = upper_outlier + lower_outlier
+            if sum(outlier) < outlier_tol * data_time.shape[1]:
+                port_list.append(index)
+        return port_list
+
+    @staticmethod
+    def __remove_outlier_by_novelty_detection(data_time):
+        """remove the outliers in the cluster by novelty detection
+        :param data_time: return TS table provided by user
+        :return: port_list: a list of portfolios which are not outliers
+        """
+        clf = svm.OneClassSVM()
+        clf.fit(data_time)
+        outlier_predicted = clf.predict(data_time)
+        port_list = (outlier_predicted == 1)
+        return port_list
+
+    def remove_outlier(self, label, data_time, cluster_label, data_dim=None, rmv_std_tol=3, outlier_tol=0.2, method='rmv_by_std'):
+        """remove the outlier in the cluster
+        :param label: cluster id
+        :param data_time:
+        :param cluster_label:
+        :param data_dim:
+        :param rmv_std_tol:
+        :param outlier_tol: outlier threshold, default value is 0.2
+        :param method: method for removing outlier, default method is by std band, otherwise by novelty detection
+        :return: data_time_rmv_outlier: return TS table without outlier;
+            data_dim_rmv_outlier: dimensional info table without outlier
+        """
+        data_time_temp, data_dim_temp = self.extract_info_from_cluster(label, data_time, cluster_label, data_dim)
+
+        if method == 'rmv_by_std':
+            location_list, _, std_list = self.__cluster_robust_mean_std(data_time_temp)
+            port_list = self.__remove_outlier_by_std(data_time_temp, location_list, std_list, rmv_std_tol, outlier_tol)
+            data_time_rmv_outlier = data_time_temp.loc[port_list]
+            if not (data_dim is None):
+                data_dim_rmv_outlier = data_dim_temp.loc[port_list]
+            else:
+                data_dim_rmv_outlier = pd.DataFrame()
+            return data_time_rmv_outlier, data_dim_rmv_outlier
+        elif method == 'novelty_detection':
+            port_list = self.__remove_outlier_by_novelty_detection(data_time_temp)
+            data_time_rmv_outlier = data_time_temp.loc[port_list]
+            if not (data_dim is None):
+                data_dim_rmv_outlier = data_dim_temp.loc[port_list]
+            else:
+                data_dim_rmv_outlier = pd.DataFrame()
+            return data_time_rmv_outlier, data_dim_rmv_outlier
+        else:
+            self.__raise_error('Undefined method for removing outliers.')
+
+    def __extract_flag_table(self, label, data_time_rmv_outlier, data_original, location, std, std_tol=2, abs_diff=False, rel_diff=False):
+        """extract the exceptions from the return TS table provided by user
+        :param label:
+        :param data_time_rmv_outlier: return TS table provided by user
+        :param data_original:
+        :param location: cluster centroid
+        :param std: standard deviation band
+        :param std_tol: std threshold
+        :param abs_diff:
+        :param rel_diff:
+        :return: flag_table: summarized information for exceptions
+        """
+        original_temp = data_original.loc[data_time_rmv_outlier.index, :]
+        original_temp.columns = pd.to_datetime(original_temp.columns, infer_datetime_format=True)
+        data_time_rmv_outlier.columns = pd.to_datetime(data_time_rmv_outlier.columns, infer_datetime_format=True)
+        original_temp = original_temp.loc[:, data_time_rmv_outlier.columns]
+        days = data_time_rmv_outlier.shape[1]
+        upper_bound = location + std_tol * std
+        lower_bound = location - std_tol * std
+        table_list = []
+
+        if abs_diff and rel_diff:
+            location_list_original, _, _ = self.__cluster_robust_mean_std(original_temp)
+
+        for index in data_time_rmv_outlier.index:
+            temp_time = data_time_rmv_outlier.loc[index]
+            temp_time_original = original_temp.loc[index]
+            upper_outlier = (data_time_rmv_outlier.loc[index].reshape(-1, 1) > upper_bound).reshape(days,)
+            lower_outlier = (data_time_rmv_outlier.loc[index].reshape(-1, 1) < lower_bound).reshape(days,)
+            outlier = upper_outlier + lower_outlier
+            if abs_diff and rel_diff:
+                abs_outlier = ((np.abs(original_temp.loc[index].reshape(-1, 1) - location_list_original)) > abs_diff).reshape(days,)
+
+                diff_temp = original_temp.loc[index].reshape(-1, 1) - location_list_original
+                rel_outlier = (np.abs(diff_temp / location_list_original) > rel_diff).reshape(days,)
+
+                outlier = outlier * abs_outlier
+                outlier = outlier * rel_outlier
+
+            if sum(outlier) == 0:
+                continue
+            else:
+                flag_series = temp_time[outlier]
+                flag_series.rename('value_transformed', inplace=True)
+                flag_series_original = temp_time_original[outlier].values.tolist()
+                # ## plot debug
+                # print(type(flag_series))
+                # print(flag_series)
+                temp = flag_series.reset_index(level=[0])
+                temp.rename(columns={'index': 'Time'}, inplace=True)
+                temp['value_original'] = flag_series_original
+                temp['mean'] = location[outlier]
+                temp['std'] = std[outlier]
+
+                if isinstance(index, tuple):
+                    for i in range(len(data_time_rmv_outlier.index.names)):
+                        temp[data_time_rmv_outlier.index.names[i]] = index[i]
+                elif isinstance(index, str):
+                    for i in range(len(data_time_rmv_outlier.index.names)):
+                        temp[data_time_rmv_outlier.index.names[i]] = index
+
+                temp['cluster'] = label
+                table_list.append(temp)
+        if len(table_list) == 0:
+            return pd.DataFrame()
+        else:
+            flag_table = pd.concat(table_list)
+            return flag_table
+
+    def __find_time_index(self, time, data_time_rmv_outlier):
+        """find the index for given time
+        :param time: datetime object provided by user
+        :param data_time_rmv_outlier:
+        :return: index
+        """
+        time_list = pd.to_datetime(data_time_rmv_outlier.columns.tolist(), infer_datetime_format=True).tolist()
+        index = time_list.index(time)
+        return index
+
+    @staticmethod
+    def __get_distance(flag_result):
+        """calculate how many stds away in cluster
+        :param flag_result: a summary table for flagging
+        :return: insert #_stds away in flagging result
+        """
+        return np.abs(flag_result['value_transformed'] - flag_result['mean']) / flag_result['std']
+
+    def __flag_point(self, flag_table, data_time_rmv_outlier):
+        """find the top three flagging points with highest #_stds_away
+        :param flag_table: a summary table for flagging
+        :param data_time_rmv_outlier:
+        :return time_series: a list of timestamp
+        :return: value_series: a list of return values corresponding to the timestamp
+        """
+        distance_sort_id = flag_table['# stds away'].values.argsort()
+        n = min([3, len(flag_table)])
+        max_index = distance_sort_id[-1 * n:]
+        max_table = flag_table.iloc[max_index]
+        try:
+            time_series = pd.to_datetime(max_table[data_time_rmv_outlier.columns.name], infer_datetime_format=True)
+        except ValueError:
+            time_series = pd.to_datetime(max_table['Time'], infer_datetime_format=True)
+        value_series = max_table['value_transformed']
+        return time_series, value_series
+
+    def __get_exceptions(self, label, data_time_rmv_outlier, data_original, std_tol=2, abs_diff=False, rel_diff=False):
+        """generate exception table
+        :param label:
+        :param data_time_rmv_outlier: data_time provided by user
+        :param data_original:
+        :param std_tol: threshold for standard deviation
+        :param abs_diff:
+        :param rel_diff:
+        :return: flag_table: a summary table for flagginglinewidth=0.6, figsize=(10, 6)
+        """
+        location_list, _, std_list = self.__cluster_robust_mean_std(data_time_rmv_outlier)
+        flag_table = self.__extract_flag_table(label, data_time_rmv_outlier, data_original, location_list, std_list, std_tol, abs_diff, rel_diff)
+        if len(flag_table) > 0:
+            flag_table['# stds away'] = self.__get_distance(flag_table)
+        return flag_table
+
+    def generate_exception(self, label, data_time, cluster_label, data_original, rmv_outlier=True, std_tol=2, method='rmv_by_std',
+                           abs_diff=False, rel_diff=False):
+        '''
+        :param label:
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param rmv_outlier:
+        :param std_tol:
+        :param method:
+        :param abs_diff:
+        :param rel_diff:
+        :return:
+        '''
+        if rmv_outlier:
+            data_time_rmv_outlier, _ = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, method=method)
+        else:
+            data_time_rmv_outlier, _ = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label)
+
+        flag_table = self.__get_exceptions(label, data_time_rmv_outlier, data_original, std_tol, abs_diff, rel_diff)
+        return flag_table
+
+    def generate_all_exceptions(self, data_time, cluster_label, data_original, rmv_outlier=True, std_tol=2, method='rmv_by_std',
+                                abs_diff=False, rel_diff=False):
+        """generate exceptions for all cluster
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param std_tol: threshold for standard deviation, default value is 2
+        :param outlier_tol: threshold for removing outliers, default value is 0.2
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param abs_diff:
+        :param rel_diff:
+        :return flag_results: exceptions from all clusters
+        """
+        log_fun_info(logger)
+        flag_result = pd.DataFrame()
+        if isinstance(cluster_label, pd.DataFrame):
+            cluster_label = cluster_label.iloc[:, 0]
+        cluster_label_list = cluster_label.unique()
+        cluster_label_list.sort()
+        for label in cluster_label_list:
+            if rmv_outlier:
+                data_time_rmv_outlier, _ = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, method=method)
+            else:
+                data_time_rmv_outlier, _ = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label)
+
+            flag_table = self.__get_exceptions(label, data_time_rmv_outlier, data_original, std_tol, abs_diff, rel_diff)
+            if len(flag_result) == 0:
+                if len(flag_table) == 0:
+                    pass
+                else:
+                    flag_result = flag_table
+            else:
+                flag_result = flag_result.append(flag_table)
+        if rmv_outlier:
+            logger.info('Generated all exceptions by %.1f standard deviation band and removed outliers by %s' % (std_tol, method))
+        else:
+            logger.info('Generated all exceptions by %.1f standard deviation band.' % (std_tol))
+        return flag_result
+
+    @staticmethod
+    def __plot_ts(data_time_rmv_outlier, label, location_list, std_list, std_tol=2):
+        """plot portfolio return time series in a cluster
+        :param data_time_rmv_outlier: data_time provided by user
+        :param label: cluster id
+        :param location_list: cluster centroid
+        :param std_list: standard deviation band
+        :param std_tol: threshold for standard deviation, default value is 2
+        :return figure: a figure for portfolio return time series
+        """
+        upper_bound = location_list + std_tol * std_list
+        lower_bound = location_list - std_tol * std_list
+        upper_bound = upper_bound.reshape(upper_bound.shape[0])
+        lower_bound = lower_bound.reshape(lower_bound.shape[0])
+
+        n_ports = data_time_rmv_outlier.shape[0]
+        data_time_rmv_outlier.columns = pd.to_datetime(data_time_rmv_outlier.columns, infer_datetime_format=True)
+
+        # plt.figure(figsize=(30, 20))
+        figure = data_time_rmv_outlier.T.plot(linewidth=0.6, figsize=(10, 6))
+        figure.plot(data_time_rmv_outlier.columns, location_list, 'r', linestyle='--')
+        figure.fill_between(data_time_rmv_outlier.columns, lower_bound, upper_bound, color='r', alpha=0.5)
+        figure.set_title('cluster_{}'.format(label))
+        figure.text(0.8, 0.95, '%d points MSE: %.4f' % (n_ports, std_list.mean()), style='italic',
+                    bbox={'facecolor': 'r' + 'ed', 'alpha': 0.5, 'p' + 'ad': 10}, transform=figure.transAxes)
+
+        figure.legend().set_visible(False)
+        return figure
+
+    def plot_cluster_ts(self, label, data_time, cluster_label, data_original, mark_top_3=False, rmv_outlier=True,
+                        std_tol=2, method='rmv_by_std', show=True):
+        """plot the return time series and save the figure
+        :param label: cluster id
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param mark_top_3: whether to mark top3 exceptions in the figure, default value is False
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param std_tol: threshold for standard deviation, default value is 2
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param show: whether to show the plot
+        :return figure: figure object
+        """
+        if rmv_outlier:
+            data_time_rmv_outlier, _ = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, method=method)  # if novelty, could be empty
+        else:
+            data_time_rmv_outlier, _ = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label)
+
+        location_list, _, std_list = self.__cluster_robust_mean_std(data_time_rmv_outlier)
+        if len(data_time_rmv_outlier) == 0:
+            logger.warning('No portfolios remained in cluster {}. Did you use novelty detection?'.format(label))
+        else:
+            figure = self.__plot_ts(data_time_rmv_outlier, label, location_list, std_list, std_tol)
+            flag_table = self.__get_exceptions(label, data_time_rmv_outlier, data_original, std_tol)
+            if len(flag_table) > 2:
+                if mark_top_3:
+                    time_series, value_series = self.__flag_point(flag_table, data_time_rmv_outlier)
+                    #    time_index = list(map(self.__find_time_index, time_series))
+                    figure.plot(time_series, value_series, 'o', color='b', markersize=10)
+            figure_name = '\cluster_{}.png'.format(label)
+            # print(figure_name)
+            # plot_path = self.plot_path + figure_name
+            # plt.savefig(plot_path, dpi=300)
+            # plt.close()
+            return figure
+            # if show:
+            #     plt.show()
+            # plt.close()
+
+    def plot_cluster_dim(self, label, data_time, cluster_label, data_dim, feature=[],
+                         rmv_outlier=True, method='rmv_by_std', show=True):
+        """plot the pie chart for feature components and the entropy bar chart
+        :param label: cluster id
+        :param data_time:
+        :param cluster_label:
+        :param data_dim:
+        :param feature: str or list of features to plot, at most five features in total
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param show: whether to show the plot
+        :return ax: a figure object
+        """
+        if rmv_outlier:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim, method=method)  # if novelty, could be empty
+        else:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim)
+        if len(data_time_rmv_outlier) == 0:
+            logger.warning('No portfolios remained in cluster %d. Did you use novelty detection?' % (label))
+
+        if isinstance(feature, str):
+            if not (feature in data_dim_rmv_outlier.columns):
+                self.__raise_error('%s is not a dimensional feature.' % (feature))
+            temp = data_dim_rmv_outlier[feature].value_counts()
+            label_list = temp.index
+            # plt.figure(figsize=(5, 5))
+            figure = temp.plot(kind='pie', autopct='%.2f', labels=label_list, title=feature, fontsize=10, figsize=(10, 10))
+            figure.set_ylabel('')
+            figure_name = '\cluster_{}_{}_dist.png'.format(label, feature)
+            # plot_path = self.plot_path + figure_name
+            # plt.savefig(plot_path)
+            # if show:
+            #     plt.show()
+            # plt.close()
+            return figure
+        elif isinstance(feature, list):
+            if len(feature) > 5:
+                self.__raise_error('Too many features! Maximun 5!')
+            else:
+                plt.figure(figsize=(30, 20))
+                entropy_list = []
+                for i in range(len(feature)):
+                    plt.subplot2grid((2, 3), (int(i / 3), i % 3))
+                    if not (feature[i] in data_dim_rmv_outlier.columns):
+                        self.__raise_error('%s is not a dimensional feature.' % (feature[i]))
+                    temp = data_dim_rmv_outlier[feature[i]].value_counts()
+                    ep = entropy(temp)
+                    entropy_list.append(ep)
+                    label_list = temp.index
+                    #   temp.plot(kind='pie', autopct='%.2f', labels=label_list, title=feature[i], fontsize=20)
+                    figure = temp.plot(kind='pie', autopct='%.2f', labels=label_list, fontsize=20)
+                    figure.set_title(feature[i], fontsize=30)
+                    figure.set_ylabel('')
+
+                ax = plt.subplot2grid((2, 3), (1, 2))
+                ax.bar(range(len(entropy_list)), entropy_list)
+                ax.set_ylabel('Entropy')
+                ax.set_xticks(np.array(range(len(feature))) + 0.5)
+                ax.set_xticklabels(feature, rotation=70, fontsize=20)
+                ax.set_ylim(0, max(entropy_list))
+                figure_name = '\cluster_{}_dim_dist.png'.format(label)
+                # plot_path = self.plot_path + figure_name
+                # plt.savefig(plot_path)
+                # if show:
+                #     plt.show()
+                # plt.close()
+                return ax
+        else:
+            self.__raise_error('Input feature should be either a string or list of strings.')
+
+    def generate_all_plot(self, data_time, cluster_label, data_original, data_dim, feature=[],
+                          mark_top_3=False, rmv_outlier=True, std_tol=2, method='rmv_by_std'):
+        """generate all plots
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param data_dim:
+        :param feature: a list of dimensional features, default value is ['mandate', 'mandate_group', 'mgmt_style', 'portfolio_type', 'currency']
+        :param mark_top_3: whether to mark top 3 exceptions in the time series plot
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param std_tol: threshold for standard deviation, default value is 2
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        """
+        if isinstance(cluster_label, pd.DataFrame):
+            cluster_label = cluster_label.iloc[:, 0]
+        cluster_label_list = cluster_label.unique()
+        cluster_label_list.sort()
+        for label in cluster_label_list:
+            self.plot_cluster_ts(label, data_time, cluster_label, data_original, mark_top_3, rmv_outlier, std_tol, method, show=False)
+            self.plot_cluster_dim(label, data_time, cluster_label, data_dim, feature, rmv_outlier, method, show=False)
+        logger.info('Generated all plots.')
+
+    @staticmethod
+    def __two_feature_entropy(data_dim_rmv_outlier, feature):
+        """calculate the entropy for two combined features
+        :param data_dim_rmv_outlier: data_dim privided by user
+        :param feature: a list of features
+        :return entropy_dict: a dictionary containing the entropy of combined features
+        """
+        entropy_dict = dict()
+        columns_combination = list(itertools.combinations(feature, 2))  # #list of tuples
+        for column_combine in columns_combination:
+            column_combine_temp = list(column_combine)
+            temp_data = data_dim_rmv_outlier.applymap(lambda x: str(x))
+            combine_array = temp_data[column_combine_temp].apply(lambda x: '_'.join(x), axis=1)
+            count_temp = combine_array.value_counts()
+            en = entropy(count_temp)
+            entropy_dict['&'.join(column_combine_temp) + '_entropy'] = en
+        return entropy_dict
+
+    @staticmethod
+    def __select_label(temp):
+        """find the top 3 value for the each feature
+        :param temp: an pandas series for value counts
+        :return label: a list for top 3 values
+        """
+        label = []
+        for i in range(3):
+            if i < len(temp):
+                label.append(temp.index[i])
+            else:
+                label.append('')
+        return label
+
+    def get_cluster_info(self, label, data_time, cluster_label, data_dim=None, feature=[],
+                         rmv_outlier=True, method='rmv_by_std', calculate_entropy=True, tight_thresh=1):
+        """generate the cluster information table
+        :param label: cluster id
+        :param data_time:
+        :param cluster_label:
+        :param data_dim:
+        :param feature: a list of features, default value is ['mandate', 'mandate_group', 'mgmt_style', 'portfolio_type', 'currency']
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param calculate_entropy: whether to calculate the entropy of features
+        :param tight_thresh: threshold to determine whether a cluster is tight enough
+        :return df_result: summarized information for a given cluster
+        """
+        if rmv_outlier:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim, method=method)  # if novelty, could be empty
+        else:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim)
+
+        if len(data_time_rmv_outlier) == 0:
+            logger.warning('No portfolios remained in cluster {}. Did you use novelty detection?'.format(label))
+
+        location_list, _, std_list = self.__cluster_robust_mean_std(data_time_rmv_outlier)
+
+        sum_dict = dict()
+        sum_dict['n_points'] = len(data_time_rmv_outlier)
+        sum_dict['mse'] = std_list.mean()  # square error(square) or root square error(std)
+        sum_dict['volatility'] = location_list.std()
+        sum_dict['mse/volatility'] = sum_dict['mse'] / sum_dict['volatility']
+
+        cover_index = []
+        cover_list = pd.DataFrame()
+        if (sum_dict['n_points'] >= 5) and (sum_dict['mse/volatility'] <= tight_thresh):
+            cover_index = data_time_rmv_outlier.index.tolist()
+            cluster_label_list = np.array([label] * len(cover_index))
+            cover_list = pd.DataFrame(cluster_label_list, index=cover_index, columns=[cluster_label.name])
+
+        if calculate_entropy:
+            if isinstance(feature, str):
+                feature = [feature]
+            elif isinstance(feature, list):
+                pass
+            else:
+                self.__raise_error('Input feature should be either a string or list of strings.')
+            entropy_list = []
+            label_list_dict = dict()
+            for i in range(len(feature)):
+                if not (feature[i] in data_dim_rmv_outlier.columns):
+                    self.__raise_error('%s is not a dimensional feature.' % (feature[i]))
+                temp = data_dim_rmv_outlier[feature[i]].value_counts()
+                ep = entropy(temp)
+                entropy_list.append(ep)
+                label_list = self.__select_label(temp)
+                for j in range(3):
+                    label_list_dict[feature[i] + '_top_%d' % (j + 1)] = label_list[j]
+
+            for i in range(len(entropy_list)):
+                column = feature[i]
+                sum_dict[column + '_entropy'] = entropy_list[i]
+
+            if len(feature) > 1:
+                two_feature_entropy_dict = self.__two_feature_entropy(data_dim_rmv_outlier, feature)
+                df_append_1 = pd.DataFrame(two_feature_entropy_dict, index=[label])
+            df_append_2 = pd.DataFrame(label_list_dict, index=[label])
+
+        df_result = pd.DataFrame(sum_dict, index=[label])
+
+        if calculate_entropy:
+            df_result = pd.concat([df_result, df_append_2], axis=1)
+            if len(feature) > 1:
+                df_result = pd.concat([df_result, df_append_1], axis=1)
+
+        return df_result, cover_list
+
+    def generate_all_cluster_info(self, data_time, cluster_label, data_dim=None, feature=[],
+                                  rmv_outlier=True, method='rmv_by_std', calculate_entropy=True, tight_thresh=1):
+        """generate the cluster information for all clusters
+        :param data_time:
+        :param cluster_label:
+        :param data_dim:
+        :param feature: a list of features, default value is ['mandate', 'mandate_group', 'mgmt_style', 'portfolio_type', 'currency']
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param calculate_entropy: whether to calculate the entropy of feature
+        :param tight_thresh: threshold to determine whether a cluster is tight enough
+        :return result: summarized information for all clusters
+        """
+        result = pd.DataFrame()
+        cover_index_list = pd.DataFrame()
+        if isinstance(cluster_label, pd.DataFrame):
+            cluster_label = cluster_label.iloc[:, 0]
+        cluster_label_list = cluster_label.unique()
+        cluster_label_list.sort()
+        for label in cluster_label_list:
+            df_result, cover_index = self.get_cluster_info(label, data_time, cluster_label, data_dim, feature, rmv_outlier, method, calculate_entropy, tight_thresh)
+            cover_index_list = cover_index_list.append(cover_index)
+            if len(result) == 0:
+                result = df_result
+            else:
+                result = result.append(df_result)
+        logger.info('Generated all cluster information.')
+        return result, cover_index_list
+
+    def generate_one(self, label, data_time, cluster_label, data_original, data_dim=None, feature=[],
+                     mark_top_3=False, rmv_outlier=True, std_tol=2, method='rmv_by_std', calculate_entropy=True,
+                     tight_thresh=1, abs_diff=False, rel_diff=False):
+        """generate the result for one cluster
+        :param label: cluster id
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param data_dim:
+        :param feature: a list of features, default value is ['mandate', 'mandate_group', 'mgmt_style', 'portfolio_type', 'currency']
+        :param mark_top_3: whether to mark top 3 exceptions in time series figure
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param std_tol: threshold for standard deviation, default value is 2
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param calculate_entropy: whether to calculate the entropy of feature
+        :param tight_thresh:
+        :param abs_diff:
+        :param rel_diff:
+        :return flag_table: exception table for given cluster
+        """
+        if rmv_outlier:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.remove_outlier(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim, method=method)  # if novelty, could be empty
+        else:
+            data_time_rmv_outlier, data_dim_rmv_outlier = self.extract_info_from_cluster(label, data_time=data_time, cluster_label=cluster_label, data_dim=data_dim)
+        filename = '\cluster_{}_dim_info.csv'.format(label)
+        file_path = self.plot_path + filename
+
+        flag_table = self.__get_exceptions(label, data_time_rmv_outlier, data_original, std_tol, abs_diff, rel_diff)
+        cluster_info_table, cover_index = self.get_cluster_info(label, data_time, cluster_label, data_dim, feature, rmv_outlier, method, calculate_entropy, tight_thresh)
+        # self.plot_cluster_ts(label, data_time, cluster_label, data_original, mark_top_3, rmv_outlier, std_tol, method, show=False)
+        if not (data_dim is None):
+            data_dim_rmv_outlier.to_csv(file_path)
+            # self.plot_cluster_dim(label, data_time, cluster_label, data_dim, feature, rmv_outlier, method, show=False)
+        return cluster_info_table, flag_table, cover_index
+
+    def generate_cluster_all(self, data_time, cluster_label, data_original, data_dim=None, feature=[],
+                             mark_top_3=False, rmv_outlier=True, std_tol=2, method='rmv_by_std', calculate_entropy=True,
+                             tight_thresh=1, abs_diff=False, rel_diff=False):
+        """generate result for all clusters
+        :param data_time:
+        :param cluster_label:
+        :param data_original:
+        :param data_dim:
+        :param feature: a list of features, default value is ['mandate', 'mandate_group', 'mgmt_style', 'portfolio_type', 'currency']
+        :param mark_top_3: whether to mark top 3 exceptions in time series figure
+        :param rmv_outlier: whether to remove outliers in each cluster
+        :param std_tol: threshold for standard deviation, default value is 2
+        :param method: method used for removing outliers, default method is by std, otherwise by novelty detection
+        :param calculate_entropy: whether to calculate the entropy of feature
+        :param tight_thresh: threshold to determine whether a cluster is tight enough
+        :param abs_diff:
+        :param rel_diff:
+        :return result: cluster information table
+        :result flag_result: exceptions from all clusters
+        """
+        result = pd.DataFrame()
+        flag_result = pd.DataFrame()
+        cover_list = pd.DataFrame()
+        if isinstance(cluster_label, pd.DataFrame):
+            cluster_label = cluster_label.iloc[:, 0]
+        cluster_label_list = cluster_label.unique()
+        cluster_label_list.sort()
+        for label in cluster_label_list:
+            cluster_info_table, flag_table, cover_index = self.generate_one(label, data_time, cluster_label, data_original, data_dim, feature, mark_top_3, rmv_outlier, std_tol, method, calculate_entropy, tight_thresh, abs_diff, rel_diff)
+            cover_list = cover_list.append(cover_index)
+            if len(flag_result) == 0:
+                if len(flag_table) == 0:
+                    pass
+                else:
+                    flag_result = flag_table
+            else:
+                flag_result = flag_result.append(flag_table)
+
+            if len(result) == 0:
+                result = cluster_info_table
+            else:
+                result = result.append(cluster_info_table)
+
+        self.cover_list = cover_list
+        cover_list_name = os.path.join(self.saving_path, 'cover_list.csv')
+        self.cover_list.to_csv(cover_list_name)
+
+        if len(flag_result) > 0:
+            flag_result.set_index('cluster', inplace=True)
+        flag_result['n_points'] = result['n_points']
+        self.cluster_info = result
+        cluster_info_name = os.path.join(self.saving_path, 'cluster_info.csv')
+        self.cluster_info.to_csv(cluster_info_name)
+        self.data_stage_2 = flag_result
+        data_stage_2_name = os.path.join(self.saving_path, 'exceptions_by_back_testing.csv')
+        self.data_stage_2.to_csv(data_stage_2_name)
+        logger.info('Generated all.')
+        return result, flag_result, cover_list
+
+
+
+'mlutils.py'
+
+"""
+HeadURL:  $HeadURL: https://svn.blackrock.com/public/teams/APSG/DataScience/mltemplate_/trunk/mlutils.py $
+Last changed by:  $Author: bihan $
+Last changed on:  $Date: 2015-09-16 09:35:22 $
+
+(c)  2014 BlackRock.  All rights reserved.
+
+Description:
+
+This class provides various utility functions.
+"""
+
+__version__ = '$Revision: 0.0 $'
+
+import re
+import os
+import sys
+import glob
+import pickle
+import random
+import sklearn
+import argparse
+import tempfile
+import operator
+import subprocess
+import numpy as np  # TODO: Confirm depen
+import pandas as pd
+from scipy import stats
+from functools import reduce
+from functools import partial
+from datetime import datetime
+from hdfs import InsecureClient
+from io import StringIO, BytesIO
+from collections import defaultdict
+
+import blkbms as bms
+import blkcore.brmap as brmap
+from blkcore.user import get_user
+from blkcore.util import get_token
+from blkdbi.dataobject import DataObject
+
+
+DUMMY_COL_DELIMITER = "___"
+
+
+def sybase_to_data(server, table, query):
+    """Create pandas DataFrame from Sybase.
+    :param server: string, database server.
+    :param table: string, database table.
+    :param query: string, sql query.
+    :return: return pandas DataFrame.
+    """
+    dobj = DataObject(server, autocommit=True)
+    table = dobj.get_table(table)
+
+    query = query.format(table)
+    result = dobj.do_sql(query)
+    return pd.DataFrame.from_records(result, columns=dobj.get_result_column_names())
+
+
+def data_to_hdfs(data, client_url, hdfs_path, filename, overwrite=True, verbose=True):
+    """ Move pandas.DataFrame to HDFS.
+    :param data: pandas.DataFrame, the data to move.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    :param filename: string, the file name.
+    :param overwrite: boolean, whether to over write exiting file.
+    :param verbose: boolean, control switch for printing.
+    """
+    client = InsecureClient(client_url)
+    data_handler = StringIO()
+    data.to_csv(data_handler, index=False)
+
+    if len(hdfs_path) == 0 or hdfs_path[-1] != '/':
+        hdfs_path += '/'
+    filepath = hdfs_path + filename
+
+    data_handler.seek(0)
+
+    with data_handler as reader, client.write(filepath, overwrite=overwrite) as writer:
+        for line in reader:
+            writer.write(bytes(line, 'utf8'))
+
+        if verbose:
+            print('\n Object stored in HDFS:', filepath, '\n')
+
+
+def obj_to_hdfs(obj, client_url, hdfs_path, filename, overwrite=True, verbose=True):
+    """ Move arbitrary Python object to HDFS.
+    :param obj: the object to move.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    :param filename: string, the file name.
+    :param overwrite: boolean, whether to over write exiting file.
+    :param verbose: boolean, control switch for printing.
+    """
+    client = InsecureClient(client_url)
+    obj_handler = BytesIO()
+    pickle.dump(obj, obj_handler)
+
+    if len(hdfs_path) == 0 or hdfs_path[-1] != '/':
+        hdfs_path += '/'
+    filepath = hdfs_path + filename
+
+    obj_handler.seek(0)
+
+    with obj_handler as reader, client.write(filepath, overwrite=overwrite) as writer:
+        writer.write(reader.getbuffer())
+
+        if verbose:
+            print('\nStored in HDFS:', filepath, '\n')
+
+
+def get_hdfs_filenames(client_url, hdfs_path):
+    """Show Hadoop files and folders.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    :return: the list of file names.
+    """
+    client = InsecureClient(client_url)
+    return client.list(hdfs_path)
+
+
+def hdfs_to_data(client_url, hdfs_path, filenames, consolidated=True, low_memory=False,
+                 encoding='ISO-8859-1', parse_dates=False, strip=True, index_col=None):
+    """Get data from Hadoop.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    :param filenames: list, the list of file names.
+    :param consolidated: boolean, whether to consolidate files into one DataFrame.
+    :param low_memory: boolean, low memory usage.
+    :param encoding: string, data encoding.
+    :param parse_dates: boolean or list, whether to parse date column.
+    :param strip: boolean, whether to strip leading and trailing white spaces. (only works when
+           consolidated == True.)
+    :param index_col: string, index column name.
+    :raise ValueError: Can't set both filename and filenames.
+    :return: one pandas DataFrame or a list of DataFrames.
+    """
+    client = InsecureClient(client_url)
+
+    if len(hdfs_path) == 0 or hdfs_path[-1] != '/':
+        hdfs_path += '/'
+
+    if consolidated:
+        result = None
+    else:
+        result = []
+
+    for filename in filenames:
+        with client.read(hdfs_path + filename, encoding=encoding) as reader:
+            data = reader.read()
+            data_string = StringIO(data)
+            data = pd.read_csv(data_string, sep=",", parse_dates=parse_dates, low_memory=low_memory)
+            if index_col is not None:
+                data.set_index(index_col, inplace=True)
+            if consolidated:
+                result = pd.concat([result, data])
+            else:
+                if strip:
+                    strip_data(data)
+                result.append(data)
+
+    if consolidated:
+        if index_col is None:
+            result.reset_index(inplace=True, drop=True)
+        if strip:
+            strip_data(result)
+    return result
+
+
+def hdfs_to_obj(client_url, hdfs_path, filename):
+    """Get object from Hadoop.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    :param filename: string, file name.
+    :return: the object.
+    """
+    client = InsecureClient(client_url)
+
+    if len(hdfs_path) == 0 or hdfs_path[-1] != '/':
+        hdfs_path += '/'
+
+    filepath = hdfs_path + filename
+
+    with client.read(filepath) as reader:
+        model_bytes = reader.read()
+        b = BytesIO(model_bytes)
+        obj = pickle.load(b)
+
+    return obj
+
+
+def file_to_hdfs(unix_path, unix_sep, filename, client_url, hdfs_path):
+    """Move a single file from unix to hdfs.
+    :param unix_path: string, the unix path.
+    :param unix_sep: string, the path separator.
+    :param filename: string, the file name.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    """
+    if len(unix_path) == 0 or unix_path[-1] != unix_sep:
+        unix_path += unix_sep
+
+    if len(hdfs_path) == 0 or hdfs_path[-1] != '/':
+        hdfs_path += '/'
+
+    file_input = open(unix_path + filename)
+    client = InsecureClient(client_url)
+
+    with file_input as reader, client.write(hdfs_path + filename, overwrite=True) as writer:
+        for line in reader:
+            writer.write(bytes(line, 'utf8'))
+        print('\nFile from', unix_path, 'stored in HDFS:', hdfs_path + filename, '\n')
+
+
+def files_to_hdfs(unix_path, unix_sep, client_url, hdfs_path):
+    """Move files from unix to hdfs.
+    :param unix_path: string, the unix path.
+    :param unix_sep: string, the path separator.
+    :param client_url: string, the Hadoop client url.
+    :param hdfs_path: string, the Hadoop path (path to the folder).
+    """
+    if len(unix_path) == 0 or unix_path[-1] != unix_sep:
+        hdfs_path += unix_sep
+
+    new_files = glob.glob(unix_path + '*.csv')  # os.listdir(input_dir)
+
+    new_files.sort()
+    hdfs_files = get_hdfs_filenames(client_url, hdfs_path)
+
+    for filepath in new_files:
+        filename = os.path.basename(filepath)
+        if filename not in hdfs_files:
+            file_to_hdfs(unix_path, unix_sep, filename, client_url, hdfs_path)
+
+
+def strip_data(data, inplace=True):
+    """strip leading and trailing white spaces.
+    :param data: pandas.DataFrame, data to be stripped.
+    :param inplace: boolean, whether to alter data in place.
+    :return: stripped data.
+    """
+    if inplace:
+        temp = data
+    else:
+        temp = data.copy(deep=True)
+
+    for column in temp.columns:
+        if temp[column].dtype == 'object':
+            mask = temp[column].notnull()
+            temp.ix[mask, column] = temp.ix[mask, column].map(lambda x: x.strip())
+
+    if not inplace:
+        return temp
+
+
+def parse_url(url):
+    """Check and parse url for argparse.
+    :param url: url to parse.
+    :raise argparse error: invalid url.
+    :return: url.
+    """
+    if url[:7] != 'http://':
+        raise argparse.ArgumentTypeError("url should start with http://...")
+    return url
+
+
+def parse_date(date_string, timestamp=True):
+    """Check and parse date format for argparse.
+    :param date_string: date string to parse.
+    :raise argparse error: invalid date.
+    :param timestamp: time stamp.
+    :return: parsed date.
+    """
+    if re.match(r'\d{1,2}-\d{1,2}-\d{2}$', date_string):
+        date = datetime.strptime(date_string, '%m-%d-%y')
+    elif re.match(r'\d{1,2}-\d{1,2}-\d{4}$', date_string):
+        date = datetime.strptime(date_string, '%m-%d-%Y')
+    elif re.match(r'\d{1,2}/\d{1,2}/\d{2}$', date_string):
+        date = datetime.strptime(date_string, '%m/%d/%y')
+    elif re.match(r'\d{1,2}/\d{1,2}/\d{4}$', date_string):
+        date = datetime.strptime(date_string, '%m/%d/%Y')
+    else:
+        raise argparse.ArgumentTypeError("Invalid date input.")
+    if timestamp:
+        return date
+    else:
+        return date.date()
+
+
+def parse_string(string):
+    """Parse string.
+    :param string: string.
+    :return: parsed string.
+    """
+    string = string.replace("'", '"')
+    return string
+
+
+def on_pc():
+    """Return True if running on a PC
+    :return: True if running on a PC
+    """
+    return sys.platform == "win32"
+
+
+def table_exists(dao, table):
+    """Check if the given table exists
+    :param dao: blkdbi.DataObject
+    :param table: table name
+    :return: True if table exists
+    """
+    return dao.get_db_handle().cursor().execute("select object_id('%s')" % table).fetchone()[0] is not None
+
+
+def get_tempdb_name(dao):
+    """Get the tempdb that the connection is bound to
+    :param dao: blkdbi.DataObject
+    :return: tempdb name
+    """
+    return dao.get_db_handle().cursor().execute('select db_name(@@tempdbid)').fetchone()[0]
+
+
+def get_temptable_name(dao, prefix='pytmptbl'):
+    """Get a temptable name
+    :param dao: blkdbi.DataObject
+    :param prefix: Prefix for temp table name
+    :return: the name of the temp table to use
+    """
+    while True:
+        tblname = '%s.guest.%s_%d' % (get_tempdb_name(dao), prefix, random.randint(1000, 10000))
+        if not table_exists(dao, tblname):
+            return tblname
+
+
+def bcp(file_path, dobj, table, delimiter=',', batch=1000):
+    """Load file using Sybase bcp exectuable
+    :param file_path: File to load
+    :param dobj: blkdbi.DataObject
+    :param table: Target table name
+    :param delimiter: table delimiter, default is comma
+    :param batch: Batch size to use, defaults to 1000
+    :raise subprocess.CalledProcessError: if the BCP command fails
+    """
+
+    user = get_user()
+    password = DataObject._get_syb_passwd()
+    (fh, err_path) = tempfile.mkstemp()
+    (server, _) = dobj._get_server_info_from_tag(dobj.db_ident)
+    env = None
+    if on_pc():
+        bcp_path = os.path.join(os.environ['SYBASE'], os.environ['SYBASE_OCS'], 'bin', 'bcp')
+    else:
+        # TODO : remove this hack once we are all on v15 clients...
+        # We need to use the v15 sybase otherwise we can BCP into DATE fields
+        sybase = get_token('SYBASE')
+        bcp_path = os.path.join(sybase, 'v15', '64bit', 'OCS-15_0', 'bin', 'bcp')
+        env = {'LD_LIBRARY_PATH': sybase + '/v15/64bit/OCS-15_0/lib:' + sybase + '/v15/64bit/OCS-15_0/lib3p',
+               'SYBASE': sybase + '/v15/64bit',
+               'SYBASE_OCS': 'OCS-15_0'}
+    command = [bcp_path, table, 'in', file_path, '-U', user,
+               '-c', '-S', server, '-e', err_path, '-b', str(batch), '-t', delimiter]
+    if on_pc():
+        command.extend(['-r', '\n'])
+
+    # add password after logging the command!
+    command.extend(['-P', password])
+    os.close(fh)
+    print(command)
+    try:
+        subprocess.check_call(command, env=env)
+        os.remove(err_path)
+    except subprocess.CalledProcessError as e:
+        print(e)
+        # LOG.error(e)
+        raise
+
+
+def create_temp_table(file_path, dobj, sql, tmptbl_name=None, delimiter=',', batch=1000, show=False):
+    """create temp table using bcp.
+    :param file_path: file to load
+    :param dobj: the database object
+    :param tmptbl_name: name of temptable
+    :param sql: sql to create temptable
+    :param delimiter: table delimiter
+    :param batch: bcp batch size
+    :param show: whether to print the temp table
+    """
+    if tmptbl_name is None:
+        tmptbl_name = get_temptable_name(dobj)
+
+    if table_exists(dobj, tmptbl_name):
+        dobj.do_sql("drop table %s" % tmptbl_name)
+
+    dobj.do_sql(sql % (tmptbl_name, tmptbl_name))
+
+    bcp(file_path, dobj, tmptbl_name, delimiter, batch)
+
+    if show:
+        rows = dobj.do_sql('select * from %s' % tmptbl_name)
+        print(pd.DataFrame.from_records(rows, columns=dobj.get_result_column_names()))
+
+
+def import_clients():
+    """import client lists with client: client_server pair
+    :return: clients as dictionary
+    """
+    df = pd.read_csv(os.path.join(os.path.dirname(__file__), '../static/client_db.txt'))
+    df.set_index('CLIENT', drop=True, inplace=True)
+    return df.to_dict()['VALUE']
+
+
+# def to_except_monintor(pred, data):
+#     """write to except monintor
+#     :param pred: pd.Series, prediction
+#     :param data: pd.DataFrame, data used to identify records
+#     """
+#     pass
+
+
+def update_one_row(pred, client, cusip, fund_code, package, run_date, unique_id, server_id, priority):
+    """update one row in exception monintor
+    :param pred: prediction
+    :param client: client
+    :param cusip:
+    :param fund_code:
+    :param package:
+    :param run_date:
+    :param unique_id: to identify the row
+    :param server_id:
+    :param priority:
+    """
+
+    comment = 'Can be verified.' if pred == 'V' else 'Suggest to investigate.'
+
+    message = {}
+    message["data"] = {}
+    message["data"]["changes_map"] = {}
+    message["data"]["changes_map"]["0"] = []
+    submessage = {}
+    submessage["client"] = client
+    submessage["cusip"] = cusip
+    submessage["fund_code"] = fund_code
+    submessage["package"] = package
+    submessage["process"] = "pms"
+    submessage["run_date"] = run_date
+    submessage["unique_id"] = unique_id
+    submessage["update_fields"] = {}
+    submessage["update_fields"]["approval_reason"] = "Data Science Model"
+    submessage["update_fields"]["comments"] = comment
+
+    message["data"]["changes_map"]["0"].append(submessage)
+    message["package"] = package
+    message["process"] = "pms"
+    message["status_time"] = "11/6/2015 22:05:43.000"  # datetime.today().strftime("%x %X")
+    message["type"] = "FIELD_UPDATE"
+    message["user_id"] = "bihan"
+
+    source_id = int(str(server_id) + '03')  # source id for the exception monitor
+    bmso = bms.BMS()
+    m = bms.Message()
+    m.init(bms.SemaphoreMsgBody(message, brmap.Encode.BINARY), source_id)
+    m._header._timezone_name = "UTC"
+    m._header._time_created = int(datetime.utcnow().timestamp())
+    m._header._msg_subtype = server_id
+    m._header._msg_priority = priority
+
+    try:
+        print(m)
+        print("sending message!!!")
+        r = bmso.send(m, compress_body=True)  # returns list of response messages
+        print("message sent. Waiting for reply")
+        for i in r:
+            print(i)
+    except Exception as e:
+        print(str(e))
+    finally:
+        # It's best practice to always close your connection.
+        bmso.close()
+
+
+def df_to_json(df):
+    """Convert DataFrame to Json
+    :param df: data frame to be converted.
+    :return: the json file.
+    """
+
+    return df.to_json(orient='index')
+
+
+def csv_to_json_file(filepath, recode_dict, output_columns, savepath=None, parse_dates=False):
+    """convert csv to json file, and return json data
+    :param filepath: path to get csv
+    :param recode_dict: rename some columns
+    :param output_columns: columns to select
+    :param savepath: path to save json file
+    :param parse_dates: same as pandas parse_dates
+    :return: json data
+    """
+    df = pd.read_csv(filepath, low_memory=False, encoding='ISO-8859-1', thousands=',', parse_dates=parse_dates)
+    df.rename(columns=recode_dict, inplace=True)
+    df = df.reindex(columns=output_columns)
+    json = df.to_json(orient='index')
+    if savepath is not None:
+        ff = open(savepath, 'w')
+        ff.write(json)
+        ff.close()
+    return json
+
+
+def set_python_path(py_lib_dir, req_file):
+    """read requirements.txt file (if it exists) and construct python path for script
+    :param py_lib_dir: py lib dir
+    :param req_file: req file
+    :return: required python path to run script
+    """
+
+    if not os.path.exists(req_file):
+        return ''
+    f = None
+    elements = []
+    try:
+        f = open(req_file)
+        for line in f:
+            line = line.strip()
+            if len(line) == 0 or line.startswith('#') or line.find('==') == -1:
+                continue
+            (pkg_name, pkg_ver) = line.split('==')
+            d = os.path.join(py_lib_dir, pkg_name, pkg_ver)
+            elements.append(d)
+            sys.path.append(d)
+    except Exception as e:
+        print(e)
+    finally:
+        if f is not None:
+            f.close()
+    return ':'.join(elements)
+
+
+def identity(x):
+    """
+    Returns x
+    :param x:   obj
+    :return:    x
+    """
+    return x
+
+
+def is_none(x):
+    """
+    :param x:   obj
+    :return:    True if obj is None, else False
+    """
+    return x is None
+
+
+def is_not_none(x):
+    """
+    :param x:   obj
+    :return:    False if obj is None, else True
+    """
+    return not is_none(x)
+
+
+def merge_dict(a, b):
+    """
+    :param a:   dict
+    :param b:   dict
+    :return:    a updated with b's (k, v) associations
+    """
+    _a = a.copy()
+    _a.update(b)
+    return _a
+
+
+def merge_dicts(*dicts):
+    """
+    Merge right to left; reverse iter as input to get left to right
+    :param dicts:   iter of dicts
+    :return:        union of all dict in dicts overwritten from right to left
+    """
+    return reduce(
+        lambda x, y: merge_dict(x, y),
+        dicts,
+        dict()
+    )
+
+
+def dict_filter_by_key(d, lookup):
+    """
+    :param d:       dictionary
+    :param lookup:  iter of obj corresponding to keys
+    :return:        d filtered to include only items whose key eq lookup
+    """
+    return {k: v for k, v in d.items() if k == lookup}
+
+
+def dict_filter_by_keys(d, lookups):
+    """
+    :param d:       dictionary
+    :param lookups: iter of obj corresponding to keys
+    :return:        d filtered to include only items whose key in lookups
+    """
+    return {k: v for k, v in d.items() if k in lookups}
+
+
+def dict_filter_by_value(d, lookup):
+    """
+    :param d:       dictionary
+    :param lookup:  iter of obj corresponding to values
+    :return:        d filtered to include only items whose value eq lookup
+    """
+    return {k: v for k, v in d.items() if v == lookup}
+
+
+def dict_filter_by_lookup_in_value(d, lookup):
+    """
+    :param d:       dictionary
+    :param lookup:  iter of obj corresponding to values
+    :return:        d filtered to include only items whose value eq lookup
+    """
+    return {k: v for k, v in d.items() if lookup in v}
+
+
+def dict_filter_by_values(d, lookups):
+    """
+    :param d:       dictionary
+    :param lookups: iter of obj corresponding to values
+    :return:        d filtered to include only items whose value in lookups
+    """
+    return {k: v for k, v in d.items() if v in lookups}
+
+
+def dict_lookup(d, o, m):
+    """
+    :param d:       dictionary
+    :param o:       obj to be looked up in d
+    :param m:       method to be used to lookup o in d
+    :return:
+    """
+    return m(d, o)
+
+
+def write_obj_to_file(path, fn, obj):
+    """
+    :param path: path to file
+    :param fn:   filename
+    :param obj:  obj to be cast as str and written to file
+    """
+    with open(os.path.join(path, fn), 'w') as f:
+        f.write(str(obj))
+
+
+def roc_optimize_point(all_points, slope):
+    """
+    :param all_points:  pandas DataFrame, each row is one point in 2D space
+    :param slope:       slope of tangent line
+    :return:            list type, 2D point [x, y]
+    """
+    if(all_points.shape[0] < 1):
+        return ([None] * 2)
+    _ = all_points.iloc[0, :].tolist()
+    scores = [all_points.iloc[i, 1] - slope * all_points.iloc[i, 0] for i in range(0, all_points.shape[0])]
+    scores_np = np.array(scores)
+    result = all_points.iloc[scores_np.argmax(), :].tolist()
+    return (result)
+
+
+def compose(fns):
+    """
+    Compose arbitrary number of 1-ary functions
+    :param fns:     iter of fns for composition; f -> g -> h;
+    :return:        func ... h(g(f(x)))
+    """
+    return reduce(
+        lambda f, g: lambda x: g(f(x)),
+        fns,
+    )
+
+
+def str_format(s, *args, **kwargs):
+    """
+    Returns formatted string
+    :param s:       str
+    :param args:    tuple args
+    :param kwargs:  dict args
+    :return:        str formatted
+    """
+    return s.format(*args, **kwargs)
+
+
+def tautology(*args, **kwargs):
+    """
+    Always returns True
+    :param args:    ...
+    :param kwargs:  ...
+    :return:        True
+    """
+    return True
+
+
+def falsum(*args, **kwargs):
+    """
+    Always returns False
+    :param args:    ...
+    :param kwargs:  ...
+    :return:        False
+    """
+    return False
+
+
+def logical_complement(x):
+    """
+    Return not bool(x)
+    :param x:   obj
+    :return:    not bool(x)
+    """
+    return not bool(x)
+
+
+def null(*args, **kwargs):
+    """
+    Always return None
+    :param args:    ...
+    :param kwargs:  ...
+    :return:        None
+    """
+    return None
+
+
+def exception(*args, m=None, e=Exception, **kwargs):
+    """
+    Always return an Exception of type e
+    :param args:    ...
+    :param e:       Exception subclass
+    :param m:       str else None
+    :param kwargs:  ...
+    :raise:         Exception(m)
+    """
+    raise e(m)
+
+
+def flatten_lists(*ls):
+    """
+    Flatten a list of lists into one list
+    :param ls:  list of lists of depth 0
+    :return:    list
+    """
+    return reduce(
+        lambda x, y: x + list(y),
+        ls,
+        []
+    )
+
+
+def list_of_dict_to_dict_of_list(l):
+    """
+    Convert a list of dict to a dict of lists on common key
+    Does not assume that the lists in the resulting dict are not ragged
+    :param l:   list of dicts
+    :return:    dict of lists
+    """
+    dd = defaultdict(list)
+    item_gen = (
+        (k, v)
+        for d in l
+        for k, v in d.items()
+    )
+    for k, v in item_gen:
+        dd[k].append(v)
+    return dict(dd)
+
+
+def adjusted_coefficient_of_determination(r_square, n, p):
+    """
+    Return adjusted coefficient of determination
+    :param r_square:    R2 score from scikitlearn ensemble or linear model
+    :param n:           int sample size
+    :param p:           int total number of explanatory variables in the model not including constant terms
+    :return:            int Adjusted R2
+    """
+    print(r_square, n, p)
+    return 1 - (1 - r_square) * (n - 1) / (n - p - 1)
+
+
+def is_dummy_col(col_name):
+    """
+    Dummy column name predicate
+    :param col_name:    str column name
+    :return:            bool
+    """
+    return DUMMY_COL_DELIMITER in col_name
+
+
+def get_dummy_category(col_name):
+    """
+    Parses out category name from dummy column
+    :param col_name:    str dummy column name
+    str = category + DUMMY_COL_DELIMTER + value delimited dummy col names
+    :return:            str category
+    """
+    return col_name.split(DUMMY_COL_DELIMITER)[0]
+
+
+def get_categorized_column_names(df):
+    """
+    Get a list of "categorized" names for a list of columns in dataframe for groupby operations
+    :param df:  pd.DataFrame
+    :return:    list of str of col_name for non dummy and category name for dummies
+    """
+    return [
+        get_dummy_category(col) if is_dummy_col(col) else col
+        for col in df.columns
+    ]
+
+
+# def _remove_dummy_categoricals(ml_model, xtrain, ytrain):
+#     """
+#     Remove one of each of a pair of dummy variables
+#     :param ml_model:
+#     :param xtrain:
+#     :param ytrain:
+#     :return:
+#     """
+#     original_columns = xtrain.columns
+#     f_scores, p_values = sklearn.feature_selection.f_regression(
+#         X=xtrain[ml_model.dummy_indep_cols],
+#         y=ytrain,
+#         center=True
+#     )
+#     f_regression_df = dict(zip(('f_score', 'p_value'), (f_scores, p_values)))
+#     category_col_name = '_dummy_category'
+#     category_labels = pd.DataFrame({'_dummy_category': get_categorized_column_names(xtrain)})
+#     categorized = pd.DataFrame.concat([xtrain, f_regression_df, category_labels], axis=1)
+#     grouped_by_category = categorized.groupby(category_col_name)
+#     for group in grouped_by_category:
+#         min_p_value = group['p_value'].min()
+#         min_label = group.which(p_value == min_p_value)
+
+
+def linear_model_p_stats(ml_model, residuals, xtrain, ytrain):
+    """
+    Caculate t-statistics and p-values for a linear model
+    :param ml_model:    MLModel
+    :param residuals:   array residuals
+    :param xtrain:      pd.DataFrame xtrain
+    :param ytrain:      pd.DataFrame ytrain
+    """
+    try:
+        sse = (residuals ** 2) / float(xtrain.shape[0] - xtrain.shape[1])
+        se = np.array([
+            np.sqrt(np.diagonal(sse[i] * np.linalg.inv(np.dot(xtrain.T, xtrain))))
+            for i in range(sse.shape[0])
+        ])
+        ml_model.t_stats = ml_model.coef_ / se
+        # Two-sided test
+        ml_model.p_values = 2 * (
+            1 - stats.t.cdf(np.abs(ml_model.t_stats), xtrain.shape[0] - xtrain.shape[1])
+        )
+    except np.linalg.linalg.LinAlgError:
+        f_scores, p_values = sklearn.feature_selection.f_regression(
+            X=xtrain[ml_model.dummy_indep_cols],
+            y=ytrain,
+            center=True
+        )
+
+
+def obj_join_composer(c, a, b):
+    """
+    Take two items a, b; insert c between them
+    :param a:   obj
+    :param b:   obj
+    :param c:   obj used to join a, b
+    :return:    tuple
+    """
+    return a + (c, b)
+
+
+def obj_join(c, *objs):
+    """
+    Delimit a sequence with an object c
+    :param c:       obj used to delimit objs sequence
+    :param objs:    tuple of objects to be delimited
+    :return:        tuple of delimited objects
+    """
+    return reduce(
+        partial(obj_join_composer, c),
+        objs
+    )
+
+
+def obj_envelop(c, *objs):
+    """
+    Envelop a sequence of objs with an eveloping object c
+    :param c:       obj used to envelop objs sequence
+    :param objs:    tuple of objs
+    :return:
+    """
+    return reduce(
+        operator.add,
+        ((c,), objs, (c,)),
+        tuple()
+    )
+
+
+def f_envelop(f, g):
+    """
+    Envelop a function or procedure with two other functions
+    :param f:   function to be enveloped
+    :param g:   function to envelop
+    :return:    function
+    """
+    return compose((g, f, g))
+
+
+def f_join_composer(h, f, g):
+    """
+    Compose two functions together via an intermediary
+    :param h:   function intermediary used to join f and g
+    :param f:   function
+    :param g:   function
+    :return:    function f o h o g
+    """
+    return compose((f, h, g))
+
+
+def f_join(g, *fs):
+    """
+    Functionally compose a sequence of functions via an intermediary function g
+    :param f:
+    :param g:
+    :return:
+    """
+    return reduce(
+        partial(f_join_composer, g),
+        fs
+    )
+
+
+def is_platform_linux():
+    """
+    Is the platform linux type?
+    :return:    bool
+    """
+    return sys.platform.startswith('linux')
+
+
+def is_platform_windows():
+    """
+    Is the platform windows type?
+    :return:    bool
+    """
+    return sys.platform.startswith('win')
+
+
+def is_platform_mac():
+    """
+    Is the platform mac type?
+    :return:    bool
+    """
+    return sys.platform.startswith('darwin')
+
+
+
+'graphviz.py'
+
+
+
+
+
+
+
+'config.py'
+"""
+(c)  2014 BlackRock.  All rights reserved.
+
+Description:
+
+- This module sets basic configs
+
+"""
+
+import os
+# import getpass
+import inspect
+import logging
+
+# TODO: Could we simply use the logging codes instead of maintaining this map?
+log_levels = {'debug': logging.DEBUG,
+              'info': logging.INFO,
+              'warn': logging.WARN,
+              'error': logging.ERROR}
+
+if os.environ.get('MLTEMPLATE_LOG_PATH'):
+    LOG_PATH = os.environ.get('MLTEMPLATE_LOG_PATH')
+elif os.path.exists(r'P:\Proj\public\production_engineering\data_science\mltemplate\log'):
+    LOG_PATH = r'P:\Proj\public\production_engineering\data_science\mltemplate\log'
+elif os.path.exists(r'/proj/public/production_engineering/data_science/mltemplate/log'):
+    LOG_PATH = r'/proj/public/production_engineering/data_science/mltemplate/log'
+else:
+    LOG_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def init_logger(name, log_level='warn'):
+    """
+    Init logger
+    :param name:        logger name
+    :param log_level:   Set the console log level;
+                        Options are debug, info, warn, error
+    :return:            logger
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(log_levels['debug'])
+    formatter = logging.Formatter('%(asctime)s, %(name)s, %(levelname)s, %(message)s')
+
+    # logger.handlers = []
+    for hndlr in logger.handlers:
+        hndlr.setFormatter(formatter)
+
+    # formatter = logging.Formatter('%(message)s')
+    # ch = logging.StreamHandler()
+    # ch.setLevel(log_levels[log_level])
+    # ch.setFormatter(formatter)
+    # logger.addHandler(ch)
+
+    # secretly log to LOG_PATH
+    # NOTE: was handlers[0] below
+
+    # formatter = logging.Formatter('%(asctime)s, %(name)s, %(levelname)s, %(message)s')
+    # fh = logging.FileHandler(os.path.join(LOG_PATH, '{}.csv'.format(getpass.getuser())), mode='a')
+    # fh.setLevel(log_levels['info'])
+    # fh.setFormatter(formatter)
+    # logger.addHandler(fh)
+
+    return logger
+
+
+def config_logger(name,
+                  clvl='warn',
+                  flvl='debug',
+                  file_path=None,
+                  file_mode='w',
+                  log_format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
+    """
+    Set logger level and format
+    Always create a console stream handler
+    If file_path is not None, create FileHandler
+    :param name:        str name of logger
+    :param clvl:        str console log level
+    :param flvl:        str file log level
+    :param file_path:   str filepath
+    :param file_mode:   str file mode; standard file handle open mode options
+    :param log_format:  str log format
+    """
+    logger = logging.getLogger(name)
+    formatter = logging.Formatter(log_format)
+
+    # NOTE: Leaving this try, except for backwards compatibility with
+    #       older usages of init_logger.
+    try:
+        logger.handlers[0].setFormatter(formatter)
+        logger.handlers[0].setLevel(log_levels[clvl])
+    except IndexError:
+        sh = logging.StreamHandler()
+        sh.setFormatter(formatter)
+        sh.setLevel(log_levels[clvl])
+        logger.addHandler(sh)
+
+    if file_path is not None:
+        fh = logging.FileHandler(os.path.join(file_path), mode=file_mode)
+        fh.setLevel(log_levels[flvl])
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+
+def log_fun_info(logger, log_arg=False):
+    """
+    Log function calls
+    :param logger:      logger to pass in.
+    :param log_arg:     log function arguments or not.
+    """
+    frame, _, _, fn, _, _ = inspect.getouterframes(inspect.currentframe())[1]
+    if not log_arg:
+        logger.info('{}'.format(fn))
+    else:
+        _, _, _, argv = inspect.getargvalues(frame)
+        argv.pop('self', None)
+        argv = str(argv).replace(',', ';').replace('\n', '')
+        logger.info('{}, {}'.format(fn, argv))
+
+
+# Default logger
+logger = init_logger(__name__)
+
+"dtypes/__init__.py"
+
+"dtypes/dtype_codes.py"
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- mltemplate.mldata codes and variable management
+
+"""
+
+import operator
+from functools import reduce
+
+
+"""
+ML dtypes
+"""
+
+
+# TODO: Include byte length specification combinations with types below?
+# NOTE: pd vs. mltemplate dtypes: We don't care about byte specification, only type interface
+
+# Logical
+
+BOOLEAN = 'bool'
+
+# Numeric
+
+INT = 'int'
+FLOAT = 'float'
+COMPLEX = 'complex'
+
+# Categorical
+
+OBJECT = 'object'
+CATEGORY = 'category'
+
+# Time
+
+DATETIME = 'datetime'
+TIMEDELTA = 'timedelta'
+
+# Collections
+
+LOGICAL_DTYPES = [BOOLEAN]
+NUMERIC_DTYPES = LOGICAL_DTYPES + [INT, FLOAT, COMPLEX]
+CATEGORICAL_DTYPES = [OBJECT, CATEGORY]
+TIME_DTYPES = [DATETIME, TIMEDELTA]
+
+DTYPES = list(
+    set(
+        reduce(
+            operator.add,
+            (
+                LOGICAL_DTYPES,
+                NUMERIC_DTYPES,
+                CATEGORICAL_DTYPES,
+                TIME_DTYPES
+            ),
+        )
+    )
+)
+
+"dtypes/dtype_helpers.py"
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- Build model helper functions
+
+"""
+
+from mltemplate.config import logger
+from mltemplate.dtypes import dtype_codes
+from mltemplate.ml_models import model_codes
+
+
+def map_pd_to_ml_dtype(dtype):
+    """
+    Translate to ml dtype
+    :param dtype:     (column_name, dtype) in self.data.dtypes
+    :return:          str mltemplate dtype equivalent of pd dtype
+    :raise:           ValueError if ml_dtype mapping error
+    """
+    ml_dtypes = tuple({t for t in dtype_codes.DTYPES if t in dtype})
+
+    # If no matches, we need to add a new dtype to mltemplate
+    if not ml_dtypes:
+        msg = "Invalid dtype: {}; dtype not supported"
+        logger.error(msg.format(dtype))
+        return 'object'
+
+    # More than one dtype should never be matched
+    elif len(ml_dtypes) > 1:
+        msg = "Invalid dtype: {}; matches multiple mltemplate dtypes: {}"
+        raise ValueError(msg.format(dtype, ml_dtypes))
+
+    # In this scenario there is only one matching ml_dtype; return it
+    return ml_dtypes[0]
+
+
+def is_dtype_numeric(dtype):
+    """
+    Boolean test for dtype membership in mltemplate numeric dtypes
+    :param dtype:   str dtype
+    :return:        bool
+    """
+    return dtype in dtype_codes.NUMERIC_DTYPES
+
+
+def is_dtype_categorical(dtype):
+    """
+    Boolean test for dtype membership in mltemplate categorical dtypes
+    :param dtype:   str dtype
+    :return:
+    """
+    return dtype in dtype_codes.CATEGORICAL_DTYPES
+
+
+def get_ml_model_type(dtype):
+    """
+    Return mlmodel type corresponding to univariate target variable
+    :param dtype:   str dtype
+    :return:        str model type code
+    :raise:         ValueError
+    """
+    # Regression
+    if is_dtype_numeric(dtype):
+        return model_codes.REGRESSION_MODEL_TYPE
+
+    # Classification
+    elif is_dtype_categorical(dtype):
+        return model_codes.CLASSIFICATION_MODEL_TYPE
+
+    # Other:
+    #   y_dtype maps to unsupported machine learning task
+    msg = ";".join([
+        "dtype {} not supported for available machine learning tasks",
+        "regression ({}) and classification ({})"
+    ])
+    raise ValueError(
+        msg.format(
+            dtype,
+            ", ".join([dtype_codes.NUMERIC_DTYPES]),
+            ", ".join([dtype_codes.CATEGORICAL_DTYPES])
+        )
+    )
+
+
+"ml_metrics/__init__.py"
+
+"ml_metrics/metric_codes.py"
+
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- Model evaluation codes and variable management by task type
+
+"""
+
+from sklearn import metrics
+from mltemplate.mlutils import merge_dicts
+from mltemplate.ml_models import model_codes
+from mltemplate.ml_metrics import metric_helpers
+
+
+"""
+Regression
+"""
+
+
+R2 = 'r2'
+MEAE = 'meae'
+MSE = 'mse'
+MAE = 'mae'
+EVS = 'evs'
+INFORMATION_COEFFICIENT = 'IC'
+
+REGRESSION_METRICS = {
+    R2: metrics.r2_score,
+    MEAE: metrics.median_absolute_error,
+    MSE: metrics.mean_squared_error,
+    MAE: metrics.mean_absolute_error,
+    EVS: metrics.explained_variance_score,
+    INFORMATION_COEFFICIENT: metric_helpers.information_coefficient
+}
+
+
+"""
+Classification
+"""
+
+
+F1_SCORE = 'f1'
+LOG_LOSS = 'log_loss'
+PRECISION = 'precision'
+RECALL = 'recall'
+ACCURACY = 'accuracy'
+PRFS = 'prfs'
+CONFUSION = 'confusion'
+
+CLASSIFICATION_METRICS = {
+    F1_SCORE: metrics.f1_score,
+    LOG_LOSS: metrics.log_loss,
+    PRECISION: metrics.precision_score,
+    RECALL: metrics.recall_score,
+    ACCURACY: metrics.accuracy_score,
+    PRFS: metrics.precision_recall_fscore_support,
+    CONFUSION: metrics.confusion_matrix
+}
+
+
+"""
+Combined
+"""
+
+
+METRICS_BY_TYPE = {
+    model_codes.REGRESSION_MODEL_TYPE: REGRESSION_METRICS,
+    model_codes.CLASSIFICATION_MODEL_TYPE: CLASSIFICATION_METRICS
+}
+
+METRIC_MAP = merge_dicts(REGRESSION_METRICS, CLASSIFICATION_METRICS)
+
+
+"ml_metrics/metric_helpers.py"
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- Metrics helper functions
+
+"""
+
+import pandas as pd
+
+
+def information_coefficient(x, y, **kwargs):
+    """
+    Calculate information co-efficient for two vectors
+    :param x:
+    :param y:
+    :return:
+    """
+    return pd.np.corrcoef(x, y)[0, 1]  # TODO: why 0, 1?
+
+"ml_models/__init__.py"
+
+"ml_models/model_codes.py"
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- mltemplate.mlmodel codes and variable management
+- Make deterministic maps to function references, not function names
+
+"""
+
+from sklearn import svm
+from sklearn import tree
+from sklearn import ensemble
+from sklearn import neighbors
+from sklearn import naive_bayes
+from sklearn import linear_model
+from sklearn import discriminant_analysis
+# from mltemplate.mlutils import merge_dicts
+
+
+# TODO: All model codes must be unique
+
+
+"""
+Model / Task Types
+"""
+
+
+REGRESSION_MODEL_TYPE = 'regression'
+CLASSIFICATION_MODEL_TYPE = 'classification'
+
+MODEL_TYPES = list({REGRESSION_MODEL_TYPE, CLASSIFICATION_MODEL_TYPE})
+
+
+"""
+MLTemplate Model Codes
+"""
+
+
+"""
+Regression
+"""
+
+
+RUN_ALL_REGRESSORS = 'run_all_regressors'
+
+# Regression model codes
+
+RIDGE = 'ridge'
+LASSO = 'lasso'
+ELASTIC_NET = 'enet'
+BAGGING_REGRESSOR = 'bag'
+ADA_BOOST_REGRESSOR = 'ab'
+RANSAC_REGRESSOR = 'ransac'
+EXTRA_TREES_REGRESSOR = 'ert'
+ORDINARY_LEAST_SQUARES = 'ols'
+KNEIGHBORS_REGRESSOR = 'knnrgr'
+BAYES_RIDGE_REGRESSOR = 'bayes'
+DECISION_TREE_REGRESSOR = 'dtrgr'
+RANDOM_FOREST_REGRESSOR = 'rfrgr'
+GRADIENT_BOOSTING_REGRESSOR = 'gbrgr'
+SCALAR_VECTOR_MACHINE_REGRESSOR = 'svr'
+
+# Regression model constructors
+
+REGRESSION_MODELS = {
+    # Linear models
+    RIDGE: linear_model.Ridge,
+    LASSO: linear_model.Lasso,
+    ELASTIC_NET: linear_model.ElasticNet,
+    BAYES_RIDGE_REGRESSOR: linear_model.BayesianRidge,
+    RANSAC_REGRESSOR: linear_model.RANSACRegressor,
+    ORDINARY_LEAST_SQUARES: linear_model.LinearRegression,
+    # Ensemble
+    ADA_BOOST_REGRESSOR: ensemble.AdaBoostRegressor,
+    GRADIENT_BOOSTING_REGRESSOR: ensemble.GradientBoostingRegressor,
+    RANDOM_FOREST_REGRESSOR: ensemble.RandomForestRegressor,
+    EXTRA_TREES_REGRESSOR: ensemble.ExtraTreesRegressor,
+    BAGGING_REGRESSOR: ensemble.BaggingRegressor,
+    # Other
+    SCALAR_VECTOR_MACHINE_REGRESSOR: svm.SVR,
+    KNEIGHBORS_REGRESSOR: neighbors.KNeighborsRegressor,
+    DECISION_TREE_REGRESSOR: tree.DecisionTreeRegressor,
+}
+
+
+"""
+Classification
+"""
+
+
+RUN_ALL_CLASSIFIERS = 'run_all_classifiers'
+
+# Classification model codes
+
+BAGGING = 'bag'
+LOGISTIC_REGRESSION = 'lg'
+ADA_BOOST_CLASSIFIER = 'ab'
+GUASSIAN_NAIVE_BAYES = 'gnb'
+BERNOULI_NAIVE_BAYES = 'bnb'
+KNEIGHBORS_CLASSIFIER = 'knn'
+EXTRA_TREES_CLASSIFIER = 'ert'
+SUPPORT_VECTOR_MACHINE = 'svm'
+DECISION_TREE_CLASSIFIER = 'dt'
+RANDOM_FOREST_CLASSIFIER = 'rf'
+MULTINOMIAL_NAIVE_BAYES = 'mnb'
+GRADIENT_BOOSTING_CLASSIFIER = 'gb'
+LINEAR_DISCRIMINANT_ANALYSIS = 'lda'
+LINEAR_SCALAR_VECTOR_MACHINE = 'lsvc'
+QUADRATIC_DISCRIMINANT_ANALYSIS = 'qda'
+
+# Classification model constructors
+
+CLASSIFICATION_MODELS = {
+    # Ensemble
+    BAGGING: ensemble.BaggingClassifier,
+    ADA_BOOST_CLASSIFIER: ensemble.AdaBoostClassifier,
+    EXTRA_TREES_CLASSIFIER: ensemble.ExtraTreesClassifier,
+    RANDOM_FOREST_CLASSIFIER: ensemble.RandomForestClassifier,
+    GRADIENT_BOOSTING_CLASSIFIER: ensemble.GradientBoostingClassifier,
+    # Discriminant Analysis
+    LINEAR_DISCRIMINANT_ANALYSIS: discriminant_analysis.LinearDiscriminantAnalysis,
+    QUADRATIC_DISCRIMINANT_ANALYSIS: discriminant_analysis.QuadraticDiscriminantAnalysis,
+    # Naive bayes
+    GUASSIAN_NAIVE_BAYES: naive_bayes.GaussianNB,
+    BERNOULI_NAIVE_BAYES: naive_bayes.BernoulliNB,
+    MULTINOMIAL_NAIVE_BAYES: naive_bayes.MultinomialNB,
+    KNEIGHBORS_CLASSIFIER: neighbors.KNeighborsClassifier,
+    # Other
+    SUPPORT_VECTOR_MACHINE: svm.SVC,
+    LINEAR_SCALAR_VECTOR_MACHINE: svm.LinearSVC,
+    LOGISTIC_REGRESSION: linear_model.LogisticRegression,
+    DECISION_TREE_CLASSIFIER: tree.DecisionTreeClassifier,
+}
+
+
+"""
+Unified
+"""
+
+
+ML_MODELS_BY_TYPE = {
+    REGRESSION_MODEL_TYPE: REGRESSION_MODELS,
+    CLASSIFICATION_MODEL_TYPE: CLASSIFICATION_MODELS
+}
+
+# NOTE: Not possible becuase of overlapping model codes across types
+# ML_MODELS = merge_dicts(REGRESSION_MODELS, CLASSIFICATION_MODELS)
+
+"ml_models/model_helpers.py"
+"""
+(c)  2017 BlackRock.  All rights reserved.
+
+Description:
+
+- mlmodel helper functions
+
+"""
+
+import pandas as pd
+
+
+def feature_importance_table(feature_importances, dummy_indep_columns, group=False):
+    """
+    Transform feature importance statistics; optionally grouping dummy columns by categorical feature input
+    :param dummy_indep_columns:    list of all dummified columns used to train model
+    :param feature_importances:    np.Array feature importance statistics by column (feature)
+    :param group:                  bool group or no
+    :return:                       pd.DataFrame (feature, num dummies, percent sum F-score)
+    """
+    table_data = pd.DataFrame([feature_importances, dummy_indep_columns]).T
+    table_data.columns = ['score', 'feature']
+    table_data['score'] = table_data['score'].astype('float')
+    table_data = table_data.sort_values('score', ascending=False)
+
+    if group:
+        # Split into original categorical groups by column name pre training
+        table_data['feature'] = table_data['feature'].map(lambda x: x.split('___')[0])
+        table_data = table_data.groupby('feature')['score'].agg(['mean', 'count', 'sum'])
+        table_data = table_data.sort_values('sum', ascending=False)
+        # TODO: Confirm this math works for linear models
+        table_data['sum'] = table_data['sum'] / table_data['sum'].sum()
+        table_data['sum'] = table_data['sum'] * 100
+        table_data = table_data.reset_index()
+        table_data.rename(
+            columns={
+                'feature': 'feature',
+                'count': 'dummies',
+                'sum': 'percent_contribution'
+            },
+            inplace=True
+        )
+
+    return table_data
+
+
+    
+
+
+
+
+
+
